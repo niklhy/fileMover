@@ -1,0 +1,56 @@
+{
+  "video_grid": {
+    "root_dir": "Z:\\下载\\202605\\已下载",
+    "include_subdirs": true,
+    "overwrite_existing": true,
+    "grid_x": 4,
+    "grid_y": 5,
+    "target_width": 1600,
+    "spacing": 10,
+    "jpg_quality": 100,
+    "info_font_size": 30,
+    "video_exts": [
+      "mp4",
+      "mkv",
+      "avi",
+      "mov",
+      "wmv",
+      "flv",
+      "rmvb",
+      "ts",
+      "m2ts",
+      "mpg",
+      "mpeg"
+    ]
+  },
+  "file_organize": {
+    "source_dir": "Z:\\下载\\202607\\",
+    "include_subfolders": true,
+    "rename_video": true,
+    "rename_subtitle": true,
+    "rename_picture": true,
+    "convert_webp": true,
+    "convert_bmp": true,
+    "delete_garbage": true,
+    "dry_run": false,
+    "excluded_dirs": [
+      "Z:/下载/202607/0新下载",
+      "Z:/下载/202607/已下载"
+    ]
+  },
+  "move_videos": {
+    "video_folder": "Z:\\下载\\202607\\已下载",
+    "target_folder": "Z:\\下载\\202607\\",
+    "include_subfolders": true
+  },
+  "file_compare": {
+    "source_folder": "F:\\other\\changeDODE\\no\\202604",
+    "target_folder": "F:\\other\\changeDODE\\OK"
+  },
+  "video_check_folder": "Z:/下载/202607",
+  "video_check_include_subfolders": true,
+  "video_check_excluded_folders": [
+    "Z:\\下载\\202607\\已下载",
+    "Z:\\下载\\202607\\0新下载"
+  ]
+}
