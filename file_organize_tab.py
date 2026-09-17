@@ -12,6 +12,8 @@
 6. 显示不完整文件夹统计（无视频/无图片/无法识别/重命名失败）
 7. 统一JSON配置管理（多Tab共享）
 8. 排除文件夹功能 - 可设置多个排除目录，遍历时跳过
+9. 【新增】中文字幕后缀识别（-c, -ch等，可配置）
+10. 【新增】无码后缀保留（-UC, -UNC等，不再强制改为-Uncensored）
 """
 
 import tkinter as tk
@@ -35,7 +37,6 @@ except ImportError:
     # 如果导入失败，创建一个基本的匹配器（独立运行时）
     class PatternMatcher:
         def extract_code(self, text: str) -> Optional[Dict]:
-            import re
             patterns = [
                 (re.compile(r'^([fF][cC]2?[_-]?[pP][pP][vV][_-]?(\d{6,}))'), 'fc2_ppv'),
                 (re.compile(r'^([fF][cC]2?[_-]?(\d{6,}))'), 'fc2'),
@@ -52,7 +53,7 @@ except ImportError:
                     return {
                         'full': full_code,
                         'original': matched_text,
-                        'canonical': matched_text.replace('_', '-'),  # 添加canonical字段
+                        'canonical': matched_text.replace('_', '-'),
                         'letters': letters,
                         'numbers': numbers,
                         'type': ptype,
@@ -66,13 +67,57 @@ except ImportError:
                 return {
                     'full': full_code,
                     'original': original,
-                    'canonical': original.replace('_', '-'),  # 添加canonical字段
+                    'canonical': original.replace('_', '-'),
                     'letters': letters,
                     'numbers': numbers,
                     'type': 'generic',
                     'is_short_numeric': False
                 }
             return None
+
+        def detect_chinese_subtitle_suffix(self, filename: str) -> Optional[str]:
+            """基础版本：检测中文字幕后缀"""
+            stem = filename.rsplit('.', 1)[0] if '.' in filename else filename
+            patterns = [
+                (re.compile(r'[-_](c)(?=\.|$|[-_])', re.I), '-C'),
+                (re.compile(r'[-_](ch)(?=\.|$|[-_])', re.I), '-C'),
+            ]
+            for pattern, normalized in patterns:
+                if pattern.search(stem):
+                    return normalized
+            return None
+
+        def detect_uncensored_suffix(self, filename: str) -> Optional[str]:
+            """基础版本：检测无码后缀"""
+            stem = filename.rsplit('.', 1)[0] if '.' in filename else filename
+            patterns = [
+                (re.compile(r'[-_]UC(?=\.|$|[-_])', re.I), '-UC'),
+                (re.compile(r'[-_]UNC(?=\.|$|[-_])', re.I), '-UNC'),
+            ]
+            for pattern, normalized in patterns:
+                if pattern.search(stem):
+                    return normalized
+            return None
+
+        def detect_all_suffixes(self, filename: str) -> Dict[str, Optional[str]]:
+            return {
+                'chinese_subtitle': self.detect_chinese_subtitle_suffix(filename),
+                'uncensored': self.detect_uncensored_suffix(filename),
+            }
+
+        def build_new_filename(self, code: str, original_filename: str, 
+                               index: int = 1, total_in_group: int = 1) -> str:
+            ext = Path(original_filename).suffix
+            suffixes = self.detect_all_suffixes(original_filename)
+            suffix_part = ''
+            if suffixes['chinese_subtitle']:
+                suffix_part += suffixes['chinese_subtitle']
+            if suffixes['uncensored']:
+                suffix_part += suffixes['uncensored']
+            if total_in_group > 1:
+                return f"{code}{suffix_part}-{index}{ext}"
+            else:
+                return f"{code}{suffix_part}{ext}"
 
 # 常量定义
 VIDEO_EXTENSIONS: Set[str] = {'.avi', '.mp4', '.ts', '.rmvb', '.rm', '.mkv', '.mov', '.wmv', '.flv'}
@@ -81,13 +126,17 @@ CONVERTIBLE_EXTENSIONS: Set[str] = {'.webp', '.bmp'}
 DELETE_EXTENSIONS: Set[str] = {'.torrent', '.lnk'}
 SUBTITLE_EXTENSIONS: Set[str] = {'.srt', '.ass', '.ssa', '.vtt', '.sub', '.idx'}
 
-# 正则表达式
-PATTERN_UNCENSORED = re.compile(r'uncensored|ai\s*remove|un|uc|-u|无码|破解', re.IGNORECASE)
+# 正则表达式（仅用于界面显示等非核心匹配功能）
 PATTERN_FC2 = re.compile(r'fc2?|ppv', re.IGNORECASE)
-PATTERN_UC = re.compile(r'-UC', re.IGNORECASE)
 PATTERN_TILDE_SUFFIX = re.compile(r'~[0-9]+(?=\.)')
 
 CONFIG_FILE_NAME = "app_config.json"
+
+# 【新增】默认中文字幕后缀关键词（可配置）
+DEFAULT_CHINESE_SUBTITLE_KEYWORDS = ['-c', '-ch', '-chinese', '-cn', '-zh']
+
+# 【新增】默认无码后缀关键词（可配置）
+DEFAULT_UNCENSORED_KEYWORDS = ['-UC', '-UNC', '-Uncensored', '-un', '-破解', '-无码']
 
 
 # ========== 统一配置管理器 ==========
@@ -190,6 +239,9 @@ class OrganizeConfig:
     rename_subtitle: bool = True
     dry_run: bool = True
     excluded_dirs: List[str] = field(default_factory=list)
+    # 【新增】后缀识别配置
+    chinese_subtitle_keywords: List[str] = field(default_factory=lambda: DEFAULT_CHINESE_SUBTITLE_KEYWORDS.copy())
+    uncensored_keywords: List[str] = field(default_factory=lambda: DEFAULT_UNCENSORED_KEYWORDS.copy())
 
     def to_dict(self) -> Dict:
         return asdict(self)
@@ -209,6 +261,10 @@ class FileOrganizeWorker:
                  complete_callback: Optional[Callable] = None):
         self.config = config
         self.matcher = PatternMatcher()
+
+        # 【新增】根据配置动态添加后缀识别模式
+        self._setup_custom_patterns()
+
         self.log_callback = log_callback
         self.progress_callback = progress_callback
         self.complete_callback = complete_callback
@@ -232,15 +288,55 @@ class FileOrganizeWorker:
             'deleted': 0,
             'errors': 0,
             'skipped_no_code': 0,
-            'skipped_excluded': 0
+            'skipped_excluded': 0,
+            'chinese_subtitle_count': 0,  # 【新增】中文字幕统计
+            'uncensored_count': 0,        # 【新增】无码统计
         }
 
         self.no_picture_folders: List[Path] = []      # 有视频无图片
         self.no_video_folders: List[Path] = []        # 有图片无视频
-        self.unrecognized_folders: List[Path] = []    # 无法识别番号（新增）
-        self.rename_failed_folders: List[Tuple[Path, str]] = []  # (路径, 错误类型)（新增）
+        self.unrecognized_folders: List[Path] = []    # 无法识别番号
+        self.rename_failed_folders: List[Tuple[Path, str]] = []  # (路径, 错误类型)
 
         self.error_logs: List[str] = []
+
+    def _setup_custom_patterns(self):
+        """根据配置设置自定义后缀识别模式"""
+        # 添加中文字幕关键词
+        for keyword in self.config.chinese_subtitle_keywords:
+            if not keyword:
+                continue
+            # 转义特殊字符
+            escaped = re.escape(keyword)
+            # 构建模式：关键词前面是 - 或 _，后面是 . 或结束或 - 或 _
+            pattern_str = f'[-_]?{escaped}(?=\\.|$|[-_])'
+            # 检查是否已存在（避免重复添加）
+            exists = False
+            for p, _ in self.matcher.chinese_subtitle_patterns:
+                if keyword.lower() in p.pattern.lower():
+                    exists = True
+                    break
+            if not exists:
+                self.matcher.add_chinese_subtitle_pattern(pattern_str, '-C')
+
+        # 添加无码关键词
+        for keyword in self.config.uncensored_keywords:
+            if not keyword:
+                continue
+            escaped = re.escape(keyword)
+            pattern_str = f'[-_]?{escaped}(?=\\.|$|[-_])'
+            exists = False
+            for p, _ in self.matcher.uncensored_patterns:
+                if keyword.lower() in p.pattern.lower():
+                    exists = True
+                    break
+            if not exists:
+                # 根据关键词确定标准化后缀
+                if 'uc' in keyword.lower() and 'unc' not in keyword.lower():
+                    normalized = '-UC'
+                else:
+                    normalized = '-UNC'
+                self.matcher.add_uncensored_pattern(pattern_str, normalized)
 
     def stop(self):
         self.is_running = False
@@ -263,14 +359,14 @@ class FileOrganizeWorker:
         # 直接匹配
         if resolved in self.excluded_paths:
             return True
-        # 检查是否是排除目录的子目录（排除目录是当前目录的父目录）
+        # 检查是否是排除目录的子目录
         for excluded in self.excluded_paths:
             try:
                 if excluded in resolved.parents:
                     return True
             except Exception:
                 pass
-        # 字符串路径检查（备用，处理符号链接等特殊情况）
+        # 字符串路径检查（备用）
         for excluded in self.excluded_paths:
             try:
                 if str(resolved).startswith(str(excluded) + os.sep):
@@ -278,15 +374,6 @@ class FileOrganizeWorker:
             except Exception:
                 pass
         return False
-
-    def has_uc_suffix(self, filename: str) -> bool:
-        return bool(PATTERN_UC.search(filename))
-
-    def is_uncensored(self, filename: str) -> bool:
-        return bool(PATTERN_UNCENSORED.search(filename))
-
-    def remove_tilde_suffix(self, filename: str) -> str:
-        return PATTERN_TILDE_SUFFIX.sub('', filename)
 
     def convert_to_jpg(self, input_path: Path, output_path: Path) -> bool:
         try:
@@ -321,27 +408,53 @@ class FileOrganizeWorker:
             return False
 
     def rename_video(self, video_path: Path, code: str, index: int, total_in_group: int = 1) -> Optional[Path]:
-        has_uc = self.has_uc_suffix(video_path.name)
-        is_uncensored = self.is_uncensored(video_path.name)
+        """
+        【修改】重命名视频文件
+        使用 PatternMatcher 统一检测后缀：
+        - 中文字幕：-c, -ch 等 -> 保留为 -C
+        - 无码：-UC, -UNC 等 -> 保留原样（不再强制改为 -Uncensored）
+        """
+        # 使用 PatternMatcher 检测所有后缀
+        suffixes = self.matcher.detect_all_suffixes(video_path.name)
 
-        suffix = "-UC" if has_uc else ("-Uncensored" if is_uncensored else "")
+        # 构建后缀部分
+        # 注意：-UC 和 -UNC 中的 C 已包含中文字幕含义，不会同时存在 -C-UC 组合
+        suffix_part = ''
+        if suffixes['uncensored']:
+            # -UC 或 -UNC 已包含中文字幕含义
+            suffix_part += suffixes['uncensored']
+            self.stats['uncensored_count'] += 1
+            # UC/UNC 包含中文字幕，同时增加中文字幕计数
+            self.stats['chinese_subtitle_count'] += 1
+        elif suffixes['chinese_subtitle']:
+            # 仅中文字幕
+            suffix_part += suffixes['chinese_subtitle']
+            self.stats['chinese_subtitle_count'] += 1
 
+        # 构建新文件名
         if total_in_group > 1:
-            new_name = f"{code}{suffix}-{index}{video_path.suffix}"
+            new_name = f"{code}{suffix_part}-{index}{video_path.suffix}"
         else:
-            new_name = f"{code}{suffix}{video_path.suffix}"
+            new_name = f"{code}{suffix_part}{video_path.suffix}"
 
         new_path = video_path.parent / new_name
 
+        # 处理重名
         counter = index
         stem, suffix_ext = new_path.stem, new_path.suffix
         while new_path.exists() and new_path != video_path:
             counter += 1
-            new_name = f"{code}{suffix}-{counter}{suffix_ext}"
+            new_name = f"{code}{suffix_part}-{counter}{suffix_ext}"
             new_path = video_path.parent / new_name
 
         if self.config.dry_run:
-            self.log(f"  [试运行] 将重命名: {video_path.name} -> {new_name}")
+            suffix_desc = []
+            if suffixes['chinese_subtitle']:
+                suffix_desc.append("中文字幕")
+            if suffixes['uncensored']:
+                suffix_desc.append("无码")
+            desc = f" [{', '.join(suffix_desc)}]" if suffix_desc else ""
+            self.log(f"  [试运行] 将重命名: {video_path.name} -> {new_name}{desc}")
             return new_path
 
         try:
@@ -357,7 +470,10 @@ class FileOrganizeWorker:
             return None
 
     def rename_subtitle(self, subtitle_path: Path, new_stem: str, index: int, total_in_group: int = 1) -> Optional[Path]:
-        """重命名字幕文件，规则与视频文件一致"""
+        """
+        【修改】重命名字幕文件
+        后缀规则与视频文件保持一致（-C, -UC, -UNC 等）
+        """
         if total_in_group > 1:
             new_name = f"{new_stem}-{index}{subtitle_path.suffix}"
         else:
@@ -450,6 +566,7 @@ class FileOrganizeWorker:
         dir_name = dir_path.name
         self.stats['processed_dirs'] += 1
 
+        # 使用 PatternMatcher 提取番号
         code_info = self.matcher.extract_code(dir_name)
         has_valid_code = code_info is not None
         code = code_info['canonical'].upper() if has_valid_code else None
@@ -522,16 +639,22 @@ class FileOrganizeWorker:
                     has_rename_error = True
 
         # 处理字幕文件（与视频同步重命名）
+        # 【修改】使用 PatternMatcher 检测后缀，保持与视频一致
         if subtitles and self.config.rename_subtitle and has_valid_code:
-            has_uc = False
-            is_uncensored = False
+            # 从第一个视频检测后缀（如果有视频）
+            # 注意：-UC 和 -UNC 中的 C 已包含中文字幕含义，不会同时存在 -C-UC 组合
+            suffix_part = ''
             if videos:
                 first_video = sorted_videos[0]
-                has_uc = self.has_uc_suffix(first_video.name)
-                is_uncensored = self.is_uncensored(first_video.name)
+                suffixes = self.matcher.detect_all_suffixes(first_video.name)
+                if suffixes['uncensored']:
+                    # -UC 或 -UNC 已包含中文字幕含义
+                    suffix_part += suffixes['uncensored']
+                elif suffixes['chinese_subtitle']:
+                    # 仅中文字幕
+                    suffix_part += suffixes['chinese_subtitle']
 
-            suffix = "-UC" if has_uc else ("-Uncensored" if is_uncensored else "")
-            new_stem = f"{code}{suffix}"
+            new_stem = f"{code}{suffix_part}"
 
             for idx, subtitle_path in enumerate(sorted_subtitles, 1):
                 if not self.is_running:
@@ -594,9 +717,8 @@ class FileOrganizeWorker:
             self.log(f"  [警告] 该文件夹有图片但无视频")
             self.no_video_folders.append(dir_path)
 
-        # 记录重命名失败的文件夹（排除已经记录为无图片/无视频的情况，避免重复）
+        # 记录重命名失败的文件夹
         if has_rename_error and has_valid_code:
-            # 检查是否已存在于其他列表中
             if dir_path not in self.no_picture_folders and dir_path not in self.no_video_folders:
                 self.rename_failed_folders.append((dir_path, "文件重命名失败"))
 
@@ -607,6 +729,9 @@ class FileOrganizeWorker:
         self.log(f"源目录: {self.config.source_dir}")
         self.log(f"包含子文件夹: {'是' if self.config.include_subfolders else '否'}")
         self.log(f"试运行模式: {'开启' if self.config.dry_run else '关闭'}")
+        # 【新增】显示后缀识别配置
+        self.log(f"中文字幕识别: {', '.join(self.config.chinese_subtitle_keywords)}")
+        self.log(f"无码识别: {', '.join(self.config.uncensored_keywords)}")
         if self.config.excluded_dirs:
             self.log(f"排除目录: {len(self.config.excluded_dirs)} 个")
             for d in self.config.excluded_dirs:
@@ -667,6 +792,9 @@ class FileOrganizeWorker:
         self.log(f"  错误数: {self.stats['errors']}")
         self.log(f"  跳过(无番号): {self.stats['skipped_no_code']}")
         self.log(f"  跳过(排除目录): {self.stats['skipped_excluded']}")
+        # 【新增】后缀统计
+        self.log(f"  中文字幕文件: {self.stats.get('chinese_subtitle_count', 0)}")
+        self.log(f"  无码文件: {self.stats.get('uncensored_count', 0)}")
 
         if self.unrecognized_folders:
             self.log(f"  无法识别番号: {len(self.unrecognized_folders)}个")
@@ -718,6 +846,10 @@ class FileOrganizeTab:
         # 排除目录列表
         self.excluded_dirs: List[str] = []
 
+        # 【新增】后缀关键词列表
+        self.chinese_subtitle_keywords: List[str] = DEFAULT_CHINESE_SUBTITLE_KEYWORDS.copy()
+        self.uncensored_keywords: List[str] = DEFAULT_UNCENSORED_KEYWORDS.copy()
+
         # 创建界面
         self._create_widgets()
         self._load_from_config_manager()
@@ -741,18 +873,21 @@ class FileOrganizeTab:
         ttk.Label(info_header, text="点击展开查看功能说明", foreground="gray").pack(side=tk.LEFT, padx=10)
 
         self.info_content_frame = ttk.Frame(info_frame)
-        # 默认不pack，折叠状态
 
         info_text = (
             "本工具用于整理视频和图片文件：\n"
             "1. 根据文件夹名称自动识别番号\n"
             "2. 重命名视频文件为番号格式（多文件自动添加-1,-2后缀）\n"
-            "3. 同步重命名字幕文件（.srt/.ass/.ssa/.vtt/.sub/.idx），命名规则与视频一致\n"
-            "4. 仅在识别到有效番号时，才将图片重命名为cover.jpg\n"
-            "5. 自动转换webp、bmp格式为jpg\n"
-            "6. 删除torrent、lnk等垃圾文件\n"
-            "7. 统计并显示无视频、无图片、无法识别番号或重命名失败的文件夹\n"
-            "8. 支持设置排除目录，排除的文件夹及其子文件夹不会被处理"
+            "3. 自动识别并保留后缀：\n"
+            "   - 中文字幕：-c, -ch 等 -> 保留为 -C\n"
+            "   - 无码+中文字幕：-UC, -UNC -> 保留原样（C已含中文字幕含义）\n"
+            "4. 同步重命名字幕文件（.srt/.ass/.ssa/.vtt/.sub/.idx），命名规则与视频一致\n"
+            "5. 仅在识别到有效番号时，才将图片重命名为cover.jpg\n"
+            "6. 自动转换webp、bmp格式为jpg\n"
+            "7. 删除torrent、lnk等垃圾文件\n"
+            "8. 统计并显示无视频、无图片、无法识别番号或重命名失败的文件夹\n"
+            "9. 支持设置排除目录，排除的文件夹及其子文件夹不会被处理\n"
+            "10. 支持自定义中文字幕和无码后缀的识别关键词"
         )
         ttk.Label(self.info_content_frame, text=info_text, justify=tk.LEFT).pack(padx=10, pady=5, anchor=tk.W)
 
@@ -783,18 +918,46 @@ class FileOrganizeTab:
         exclude_list_frame = ttk.Frame(exclude_frame)
         exclude_list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
-        self.exclude_listbox = tk.Listbox(exclude_list_frame, height=4, selectmode=tk.EXTENDED)
+        self.exclude_listbox = tk.Listbox(exclude_list_frame, height=3, selectmode=tk.EXTENDED)
         self.exclude_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         exclude_scrollbar = ttk.Scrollbar(exclude_list_frame, orient=tk.VERTICAL, command=self.exclude_listbox.yview)
         self.exclude_listbox.configure(yscrollcommand=exclude_scrollbar.set)
         exclude_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
+        # ====== 【新增】后缀识别设置 ======
+        suffix_frame = ttk.LabelFrame(self.frame, text="后缀识别设置（用于标记视频特殊属性）")
+        suffix_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        # 中文字幕设置
+        chinese_frame = ttk.Frame(suffix_frame)
+        chinese_frame.pack(fill=tk.X, padx=10, pady=2)
+
+        ttk.Label(chinese_frame, text="中文字幕关键词:", width=15).pack(side=tk.LEFT)
+        self.chinese_keywords_var = tk.StringVar(value=', '.join(self.chinese_subtitle_keywords))
+        chinese_entry = ttk.Entry(chinese_frame, textvariable=self.chinese_keywords_var, width=40)
+        chinese_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+        ttk.Label(chinese_frame, text="(用逗号分隔，如: -c, -ch)", foreground="gray").pack(side=tk.LEFT)
+
+        # 无码设置
+        uncensored_frame = ttk.Frame(suffix_frame)
+        uncensored_frame.pack(fill=tk.X, padx=10, pady=2)
+
+        ttk.Label(uncensored_frame, text="无码关键词:", width=15).pack(side=tk.LEFT)
+        self.uncensored_keywords_var = tk.StringVar(value=', '.join(self.uncensored_keywords))
+        uncensored_entry = ttk.Entry(uncensored_frame, textvariable=self.uncensored_keywords_var, width=40)
+        uncensored_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+        ttk.Label(uncensored_frame, text="(用逗号分隔，如: -UC, -UNC)", foreground="gray").pack(side=tk.LEFT)
+
+        # 说明标签
+        ttk.Label(suffix_frame, text="检测到这些后缀时将保留在新文件名中，如: 番号-C.mp4 (中文字幕), 番号-UC.mp4 (无码+中文字幕)",
+                 foreground="blue").pack(padx=10, pady=(0, 5))
+
         # 操作选项
         option_frame = ttk.LabelFrame(self.frame, text="操作选项")
         option_frame.pack(fill=tk.X, padx=10, pady=5)
 
-        # 使用网格布局 - 4列2行，充分利用横向空间
+        # 使用网格布局 - 4列2行
         opt_container = ttk.Frame(option_frame)
         opt_container.pack(fill=tk.X, padx=10, pady=5)
         opt_container.columnconfigure(0, weight=1)
@@ -850,7 +1013,7 @@ class FileOrganizeTab:
         self.stats_var = tk.StringVar(value="待处理: 0 | 已处理: 0 | 错误: 0 | 跳过: 0")
         ttk.Label(progress_frame, textvariable=self.stats_var).pack(pady=(0, 5))
 
-        # 结果表格 - 修改标题以反映新增功能
+        # 结果表格
         # ========== 底部操作栏 ==========
         bottom_frame = ttk.Frame(self.frame)
         bottom_frame.pack(fill=tk.X, padx=10, pady=5)
@@ -876,14 +1039,13 @@ class FileOrganizeTab:
         ttk.Button(bottom_frame, text="立即保存配置",
                   command=self._save_to_config_manager).pack(side=tk.RIGHT, padx=5)
 
-
-
+        # 结果表格
         table_frame = ttk.LabelFrame(self.frame, text="文件夹检查结果（异常状态清单）")
         table_frame.pack(fill=tk.BOTH, padx=10, pady=5)
 
         columns = ('folder_path', 'status')
         self.result_tree = ttk.Treeview(table_frame, columns=columns,
-                                       show='headings', height=16)
+                                       show='headings', height=12)
 
         self.result_tree.heading('folder_path', text='文件夹路径')
         self.result_tree.heading('status', text='状态说明')
@@ -899,7 +1061,6 @@ class FileOrganizeTab:
 
     def _bind_events(self):
         """绑定配置自动保存事件"""
-        # 所有选项变更时自动保存到配置管理器
         self.dir_var.trace('w', lambda *args: self._save_to_config_manager())
         self.include_subfolders_var.trace('w', lambda *args: self._save_to_config_manager())
         self.rename_video_var.trace('w', lambda *args: self._save_to_config_manager())
@@ -909,6 +1070,18 @@ class FileOrganizeTab:
         self.convert_bmp_var.trace('w', lambda *args: self._save_to_config_manager())
         self.delete_garbage_var.trace('w', lambda *args: self._save_to_config_manager())
         self.dry_run_var.trace('w', lambda *args: self._save_to_config_manager())
+        # 【新增】后缀关键词变更时保存
+        self.chinese_keywords_var.trace('w', lambda *args: self._save_to_config_manager())
+        self.uncensored_keywords_var.trace('w', lambda *args: self._save_to_config_manager())
+
+    def _parse_keywords(self, keyword_str: str) -> List[str]:
+        """解析关键词字符串为列表"""
+        if not keyword_str:
+            return []
+        # 按逗号、分号或空格分隔
+        keywords = re.split(r'[,;，；\s]+', keyword_str.strip())
+        # 过滤空字符串
+        return [k.strip() for k in keywords if k.strip()]
 
     def _add_exclude_dir(self):
         """添加排除目录"""
@@ -918,11 +1091,9 @@ class FileOrganizeTab:
             initialdir=initial_dir if initial_dir else None
         )
         if directory:
-            # 检查是否已存在
             if directory in self.excluded_dirs:
                 messagebox.showinfo("提示", "该目录已在排除列表中")
                 return
-            # 检查是否与源目录冲突
             source_dir = self.dir_var.get().strip()
             if source_dir and directory == source_dir:
                 messagebox.showwarning("警告", "排除目录不能与源目录相同")
@@ -937,7 +1108,6 @@ class FileOrganizeTab:
         if not selected:
             messagebox.showinfo("提示", "请先选择要移除的目录")
             return
-        # 从后往前删除，避免索引变化
         for idx in reversed(selected):
             self.exclude_listbox.delete(idx)
             del self.excluded_dirs[idx]
@@ -954,6 +1124,10 @@ class FileOrganizeTab:
 
     def _save_to_config_manager(self):
         """保存当前设置到配置管理器"""
+        # 解析关键词
+        chinese_keywords = self._parse_keywords(self.chinese_keywords_var.get())
+        uncensored_keywords = self._parse_keywords(self.uncensored_keywords_var.get())
+
         config_data = {
             'source_dir': self.dir_var.get(),
             'include_subfolders': self.include_subfolders_var.get(),
@@ -964,14 +1138,15 @@ class FileOrganizeTab:
             'convert_bmp': self.convert_bmp_var.get(),
             'delete_garbage': self.delete_garbage_var.get(),
             'dry_run': self.dry_run_var.get(),
-            'excluded_dirs': self.excluded_dirs.copy()
+            'excluded_dirs': self.excluded_dirs.copy(),
+            # 【新增】后缀关键词配置
+            'chinese_subtitle_keywords': chinese_keywords,
+            'uncensored_keywords': uncensored_keywords,
         }
-        # 使用配置管理器保存（带分区标识）
         self.config_manager.set_section(self.CONFIG_SECTION, config_data, auto_save=True)
 
     def _load_from_config_manager(self):
         """从配置管理器加载设置"""
-        # 从配置管理器读取（带分区标识）
         section_config = self.config_manager.get_section(self.CONFIG_SECTION)
 
         if section_config:
@@ -984,6 +1159,7 @@ class FileOrganizeTab:
             self.convert_bmp_var.set(section_config.get('convert_bmp', True))
             self.delete_garbage_var.set(section_config.get('delete_garbage', True))
             self.dry_run_var.set(section_config.get('dry_run', True))
+
             # 加载排除目录
             self.excluded_dirs = section_config.get('excluded_dirs', [])
             if isinstance(self.excluded_dirs, str):
@@ -992,6 +1168,17 @@ class FileOrganizeTab:
             for d in self.excluded_dirs:
                 if d:
                     self.exclude_listbox.insert(tk.END, d)
+
+            # 【新增】加载后缀关键词配置
+            chinese_keywords = section_config.get('chinese_subtitle_keywords', DEFAULT_CHINESE_SUBTITLE_KEYWORDS)
+            if isinstance(chinese_keywords, list):
+                self.chinese_subtitle_keywords = chinese_keywords
+                self.chinese_keywords_var.set(', '.join(chinese_keywords))
+
+            uncensored_keywords = section_config.get('uncensored_keywords', DEFAULT_UNCENSORED_KEYWORDS)
+            if isinstance(uncensored_keywords, list):
+                self.uncensored_keywords = uncensored_keywords
+                self.uncensored_keywords_var.set(', '.join(uncensored_keywords))
         else:
             # 兼容旧版配置
             old_config = self.config_manager.get_section('file_organize_tab')
@@ -1026,14 +1213,13 @@ class FileOrganizeTab:
         if directory:
             self.dir_var.set(directory)
             self._save_last_browse_dir(directory)
-            # 如果排除列表中有与源目录相同的，自动移除
             if directory in self.excluded_dirs:
                 idx = self.excluded_dirs.index(directory)
                 self.excluded_dirs.pop(idx)
                 self.exclude_listbox.delete(idx)
                 self._save_to_config_manager()
             else:
-                self._save_to_config_manager()  # 立即保存
+                self._save_to_config_manager()
 
     def _log(self, message: str):
         """记录日志"""
@@ -1084,6 +1270,10 @@ class FileOrganizeTab:
         self.progress_label.config(text="正在初始化...")
         self.stats_var.set("正在计算...")
 
+        # 解析关键词
+        chinese_keywords = self._parse_keywords(self.chinese_keywords_var.get())
+        uncensored_keywords = self._parse_keywords(self.uncensored_keywords_var.get())
+
         # 创建配置
         config = OrganizeConfig(
             source_dir=source_dir,
@@ -1095,7 +1285,9 @@ class FileOrganizeTab:
             convert_bmp=self.convert_bmp_var.get(),
             delete_garbage=self.delete_garbage_var.get(),
             dry_run=self.dry_run_var.get(),
-            excluded_dirs=self.excluded_dirs.copy()
+            excluded_dirs=self.excluded_dirs.copy(),
+            chinese_subtitle_keywords=chinese_keywords,
+            uncensored_keywords=uncensored_keywords,
         )
 
         self._log(f"\n{'='*60}")
@@ -1103,6 +1295,8 @@ class FileOrganizeTab:
         self._log(f"源目录: {source_dir}")
         self._log(f"递归处理: {'是' if config.include_subfolders else '否'}")
         self._log(f"模式: {'演示' if config.dry_run else '实际执行'}")
+        self._log(f"中文字幕识别: {', '.join(chinese_keywords)}")
+        self._log(f"无码识别: {', '.join(uncensored_keywords)}")
         if config.excluded_dirs:
             self._log(f"排除目录数: {len(config.excluded_dirs)}")
         self._log(f"{'='*60}\n")
@@ -1155,15 +1349,17 @@ class FileOrganizeTab:
 
                     self.stats_var.set(
                         f"完成 | 目录: {stats['processed_dirs']} | "
-                        f"视频重命名: {stats['renamed_videos']} | "
-                        f"图片重命名: {stats['renamed_pictures']} | "
-                        f"错误: {stats['errors']} | 跳过: {stats['skipped_no_code']} | "
-                        f"排除: {stats.get('skipped_excluded', 0)}"
+                        f"视频: {stats['renamed_videos']} | "
+                        f"字幕: {stats.get('renamed_subtitles', 0)} | "
+                        f"图片: {stats['renamed_pictures']} | "
+                        f"错误: {stats['errors']} | "
+                        f"中文: {stats.get('chinese_subtitle_count', 0)} | "
+                        f"无码: {stats.get('uncensored_count', 0)}"
                     )
                     self.progress_label.config(text="处理完成")
                     self.progress_bar['value'] = 100
 
-                    # 按优先级插入表格：无法识别 -> 重命名失败 -> 无图片 -> 无视频
+                    # 按优先级插入表格
                     for folder in unrecognized_folders:
                         self.result_tree.insert('', tk.END, values=(str(folder), "无法识别番号"))
 
@@ -1176,7 +1372,6 @@ class FileOrganizeTab:
                     for folder in no_vid_folders:
                         self.result_tree.insert('', tk.END, values=(str(folder), "有图片无视频"))
 
-                    # 计算总问题数
                     total_issues = (len(unrecognized_folders) + len(rename_failed_folders) + 
                                   len(no_pic_folders) + len(no_vid_folders))
 
@@ -1186,6 +1381,8 @@ class FileOrganizeTab:
                                    f"字幕重命名: {stats.get('renamed_subtitles', 0)}\n"
                                    f"图片重命名: {stats['renamed_pictures']}\n"
                                    f"图片格式转换: {stats['converted']}\n"
+                                   f"中文字幕文件: {stats.get('chinese_subtitle_count', 0)}\n"
+                                   f"无码文件: {stats.get('uncensored_count', 0)}\n"
                                    f"无法识别番号: {len(unrecognized_folders)}\n"
                                    f"重命名失败: {len(rename_failed_folders)}\n"
                                    f"文件缺失: {len(no_pic_folders) + len(no_vid_folders)}\n"
@@ -1223,12 +1420,10 @@ class FileOrganizeTab:
     def _toggle_info(self):
         """折叠/展开功能说明"""
         if self.info_expanded.get():
-            # 当前展开，执行折叠
             self.info_content_frame.pack_forget()
             self.info_toggle_btn.config(text="▼ 展开")
             self.info_expanded.set(False)
         else:
-            # 当前折叠，执行展开
             self.info_content_frame.pack(fill=tk.X, padx=5, pady=2)
             self.info_toggle_btn.config(text="▲ 收起")
             self.info_expanded.set(True)
@@ -1242,7 +1437,7 @@ class FileOrganizeTab:
 if __name__ == "__main__":
     root = tk.Tk()
     root.title("文件整理工具 - 独立版")
-    root.geometry("900x800")
+    root.geometry("950x850")
 
     tab = FileOrganizeTab(root, controller=None)
     tab.get_frame().pack(fill=tk.BOTH, expand=True, padx=10, pady=10)

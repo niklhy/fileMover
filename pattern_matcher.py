@@ -5,7 +5,7 @@
 """番号匹配模块 - 提取和匹配文件/文件夹名称中的编号"""
 
 import re
-from typing import Optional, Dict
+from typing import Optional, Dict, List, Tuple
 
 class PatternMatcher:
     """番号提取与匹配器"""
@@ -39,6 +39,26 @@ class PatternMatcher:
             # 如 JUQ996C -> JUQ-996, aka038FHD -> aka-038, mdtm360 -> mdtm-360
             # 要求：至少2个字母 + 至少2个数字 + 可选1个字母后缀
             (re.compile(r'([a-zA-Z]{2,})(\d{2,})([a-zA-Z]?)'), 'no_hyphen_with_suffix'),
+        ]
+
+        # ========== 可配置的后缀识别模式 ==========
+        # 中文字幕后缀模式（可配置）
+        self.chinese_subtitle_patterns: List[Tuple[re.Pattern, str]] = [
+            (re.compile(r'[-_](c)(?=\.|$|[-_])', re.I), '-C'),           # -c, _c
+            (re.compile(r'[-_](ch)(?=\.|$|[-_])', re.I), '-C'),          # -ch, _ch
+            (re.compile(r'[-_](chinese)(?=\.|$|[-_])', re.I), '-C'),     # -chinese
+            (re.compile(r'[-_](cn)(?=\.|$|[-_])', re.I), '-C'),          # -cn
+            (re.compile(r'[-_](zh)(?=\.|$|[-_])', re.I), '-C'),          # -zh
+        ]
+
+        # 无码/破解后缀模式（可配置）
+        self.uncensored_patterns: List[Tuple[re.Pattern, str]] = [
+            (re.compile(r'[-_]UC(?=\.|$|[-_])', re.I), '-UC'),            # -UC, _UC
+            (re.compile(r'[-_]UNC(?=\.|$|[-_])', re.I), '-UNC'),          # -UNC, _UNC
+            (re.compile(r'[-_]Uncensored(?=\.|$|[-_])', re.I), '-UNC'),   # -Uncensored
+            (re.compile(r'[-_]un(?=\.|$|[-_])', re.I), '-UNC'),           # -un
+            (re.compile(r'[-_]破解(?=\.|$|[-_])'), '-UNC'),               # -破解
+            (re.compile(r'[-_]无码(?=\.|$|[-_])'), '-UNC'),               # -无码
         ]
 
     def extract_code(self, text: str) -> Optional[Dict]:
@@ -217,7 +237,7 @@ class PatternMatcher:
         file_letters = file_code['letters']
         folder_letters = folder_code['letters']
         file_numbers = file_code['numbers']
-        folder_numbers = file_code['numbers']
+        folder_numbers = folder_code['numbers']
 
         # 字母匹配：互相包含
         letters_match = (folder_letters in file_letters) or (file_letters in folder_letters)
@@ -241,3 +261,125 @@ class PatternMatcher:
             return 1
 
         return 0
+
+    # ========== 新增：后缀识别相关方法 ==========
+
+    def detect_chinese_subtitle_suffix(self, filename: str) -> Optional[str]:
+        """
+        检测文件名中的中文字幕后缀
+        返回标准化的后缀（如 '-C'），未找到返回 None
+        """
+        stem = Path(filename).stem if '.' in filename else filename
+        for pattern, normalized in self.chinese_subtitle_patterns:
+            if pattern.search(stem):
+                return normalized
+        return None
+
+    def detect_uncensored_suffix(self, filename: str) -> Optional[str]:
+        """
+        检测文件名中的无码/破解后缀
+        返回标准化的后缀（如 '-UC' 或 '-UNC'），未找到返回 None
+        """
+        stem = Path(filename).stem if '.' in filename else filename
+        for pattern, normalized in self.uncensored_patterns:
+            if pattern.search(stem):
+                return normalized
+        return None
+
+    def detect_all_suffixes(self, filename: str) -> Dict[str, Optional[str]]:
+        """
+        检测文件名中的所有特殊后缀
+        返回字典：{'chinese_subtitle': '-C' or None, 'uncensored': '-UC'/'-UNC' or None}
+        """
+        return {
+            'chinese_subtitle': self.detect_chinese_subtitle_suffix(filename),
+            'uncensored': self.detect_uncensored_suffix(filename),
+        }
+
+    def build_new_filename(self, code: str, original_filename: str, 
+                           index: int = 1, total_in_group: int = 1) -> str:
+        """
+        根据番号和原文件名构建新文件名
+        自动识别并保留中文字幕(-C)和无码(-UC/-UNC)后缀
+
+        注意：-UC 和 -UNC 中的 C 已包含中文字幕含义，因此不会同时存在 -C-UC 组合
+        - 仅中文字幕: 番号-C.mp4
+        - 仅无码: 番号-UC.mp4 或 番号-UNC.mp4 (UC/UNC本身已含中文字幕)
+        - 无后缀: 番号.mp4
+
+        Args:
+            code: 番号（canonical格式，如 ABC-123）
+            original_filename: 原文件名（用于检测后缀）
+            index: 当前文件序号（多文件时用于添加 -1, -2 等）
+            total_in_group: 同组文件总数
+
+        Returns:
+            新文件名（不含路径）
+        """
+        from pathlib import Path
+        ext = Path(original_filename).suffix
+
+        # 检测后缀
+        suffixes = self.detect_all_suffixes(original_filename)
+
+        # 构建后缀部分
+        # 优先级：如果已有 -UC 或 -UNC，不再添加 -C（因为C已包含中文字幕含义）
+        suffix_part = ''
+        if suffixes['uncensored']:
+            # -UC 或 -UNC 已包含中文字幕含义
+            suffix_part += suffixes['uncensored']
+        elif suffixes['chinese_subtitle']:
+            # 仅中文字幕
+            suffix_part += suffixes['chinese_subtitle']
+
+        # 多文件时添加序号
+        if total_in_group > 1:
+            return f"{code}{suffix_part}-{index}{ext}"
+        else:
+            return f"{code}{suffix_part}{ext}"
+
+    def add_chinese_subtitle_pattern(self, pattern_str: str, normalized: str = '-C'):
+        """动态添加中文字幕后缀识别模式"""
+        try:
+            compiled = re.compile(pattern_str, re.I)
+            self.chinese_subtitle_patterns.append((compiled, normalized))
+            return True
+        except re.error as e:
+            print(f"添加中文字幕模式失败: {e}")
+            return False
+
+    def add_uncensored_pattern(self, pattern_str: str, normalized: str = '-UNC'):
+        """动态添加无码后缀识别模式"""
+        try:
+            compiled = re.compile(pattern_str, re.I)
+            self.uncensored_patterns.append((compiled, normalized))
+            return True
+        except re.error as e:
+            print(f"添加无码模式失败: {e}")
+            return False
+
+    def get_chinese_subtitle_keywords(self) -> List[str]:
+        """获取当前中文字幕识别的关键词列表（用于配置显示）"""
+        keywords = []
+        for pattern, _ in self.chinese_subtitle_patterns:
+            # 从正则中提取关键词（简化处理）
+            pattern_str = pattern.pattern
+            # 提取 [-_](xxx) 中的 xxx 部分
+            match = re.search(r'\[-_\]\(([^)]+)\)', pattern_str)
+            if match:
+                keywords.append(match.group(1))
+        return keywords
+
+    def get_uncensored_keywords(self) -> List[str]:
+        """获取当前无码识别的关键词列表（用于配置显示）"""
+        keywords = []
+        for pattern, _ in self.uncensored_patterns:
+            pattern_str = pattern.pattern
+            match = re.search(r'\[-_\]\(([^)]+)\)', pattern_str)
+            if match:
+                keywords.append(match.group(1))
+        return keywords
+
+
+# 为了兼容直接运行时的 Path 导入
+from pathlib import Path

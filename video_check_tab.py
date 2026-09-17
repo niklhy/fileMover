@@ -32,9 +32,14 @@ class VideoCheckTab:
     # 支持的文件类型
     VIDEO_EXTENSIONS = {'.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.m4v', '.mpeg', '.mpg'}
     IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.jfif'}
+    SUBTITLE_EXTENSIONS = {'.srt'}
 
     # 需要跳过的文件夹名标记
     SKIP_FOLDER_MARKERS = ['(个人)', '(不好看)']
+
+    # 自带字幕的视频文件名后缀标记（不区分大小写检查）
+    # 匹配规则：文件名（去扩展名）以这些后缀结尾
+    BUILTIN_SUBTITLE_SUFFIXES = ['-C', '-c', '-UNC', 'UC']
 
     def __init__(self, parent_notebook, controller=None):
         """
@@ -83,11 +88,12 @@ class VideoCheckTab:
             "1. 遍历指定文件夹（可选包含子文件夹）\n"
             "2. 检查文件夹名称与内部视频文件名中的番号/编号是否匹配\n"
             "3. 检测文件夹中是否缺失视频文件或封面图片\n"
-            "4. 结果支持点击列头排序，右键可复制路径\n"
-            "5. 可设置排除文件夹，跳过不需要检查的目录"
+            "4. 可选检查字幕文件（.srt），文件名含 -C/-c/-UNC/UC 后缀的视频视为自带字幕\n"
+            "5. 结果支持点击列头排序，右键可复制路径\n"
+            "6. 可设置排除文件夹，跳过不需要检查的目录"
         )
 
-        self.desc_text = tk.Text(desc_frame, height=5, wrap=tk.WORD, bg='#f0f0f0', relief=tk.FLAT)
+        self.desc_text = tk.Text(desc_frame, height=6, wrap=tk.WORD, bg='#f0f0f0', relief=tk.FLAT)
         self.desc_text.grid(row=0, column=0, sticky="ew")
         self.desc_text.insert('1.0', description)
         self.desc_text.config(state=tk.DISABLED)  # 设为只读
@@ -107,18 +113,30 @@ class VideoCheckTab:
         browse_btn.grid(row=0, column=2, sticky="e")
 
         # 提示标签
-        tip_label = ttk.Label(config_frame, text="支持本地路径 (C:\\...) 或网络共享 (\\server\\share)", 
+        tip_label = ttk.Label(config_frame, text="支持本地路径 (C:\\...) 或网络共享 (\\server\\share)",
                               foreground="gray", font=('Microsoft YaHei', 8))
         tip_label.grid(row=1, column=1, sticky="w", pady=(2, 0))
 
-        # 包含子文件夹选项
+        # 包含子文件夹选项 + 检查字幕选项（同一行）
+        options_frame = ttk.Frame(config_frame)
+        options_frame.grid(row=2, column=1, sticky="w", pady=(5, 0))
+
         self.include_subfolders_var = tk.BooleanVar(value=False)
         self.subfolder_cb = ttk.Checkbutton(
-            config_frame, 
-            text="包含子文件夹 (递归遍历所有子目录)", 
+            options_frame,
+            text="包含子文件夹 (递归遍历所有子目录)",
             variable=self.include_subfolders_var
         )
-        self.subfolder_cb.grid(row=2, column=1, sticky="w", pady=(5, 0))
+        self.subfolder_cb.pack(side=tk.LEFT, padx=(0, 20))
+
+        # 新增：检查字幕文件选项
+        self.check_subtitle_var = tk.BooleanVar(value=False)
+        self.subtitle_cb = ttk.Checkbutton(
+            options_frame,
+            text="检查是否有字幕文件",
+            variable=self.check_subtitle_var
+        )
+        self.subtitle_cb.pack(side=tk.LEFT)
 
         # ========== 排除文件夹区域 (新增) ==========
         exclude_frame = ttk.LabelFrame(config_frame, text="排除文件夹 (这些文件夹及其子目录将被跳过)", padding=5)
@@ -148,7 +166,7 @@ class VideoCheckTab:
         self.clear_exclude_btn.pack(side=tk.TOP, pady=2)
 
         # 提示标签
-        exclude_tip = ttk.Label(exclude_frame, text="提示：设置新的基础文件夹时，排除列表将自动清空", 
+        exclude_tip = ttk.Label(exclude_frame, text="提示：设置新的基础文件夹时，排除列表将自动清空",
                                 foreground="gray", font=('Microsoft YaHei', 8))
         exclude_tip.grid(row=3, column=0, sticky="w", pady=(2, 0))
 
@@ -186,8 +204,8 @@ class VideoCheckTab:
         # 创建表格
         columns = ("folder_path", "file_name", "folder_code", "file_code", "issue_type", "detail")
         self.tree = ttk.Treeview(
-            result_frame, 
-            columns=columns, 
+            result_frame,
+            columns=columns,
             show='headings',
             selectmode='browse'
         )
@@ -273,12 +291,11 @@ class VideoCheckTab:
 
             # 可选提示：如果选择的文件夹不在基础文件夹内，给出确认提示
             if not folder_normalized.startswith(base_normalized + os.sep):
-                if not messagebox.askyesno("确认", 
+                if not messagebox.askyesno("确认",
                     f"选择的文件夹:\n{folder_normalized}\n\n不在基础文件夹内:\n{base_normalized}\n\n确定要添加吗？"):
                     return
 
         self.excluded_listbox.insert(tk.END, folder_normalized)
-
 
     def _remove_excluded_folder(self):
         """移除选中的排除文件夹"""
@@ -310,6 +327,8 @@ class VideoCheckTab:
                 # 使用特定的键名，避免与其他tab冲突
                 self.folder_var.set(config.get(f"{self.config_key}_folder", ""))
                 self.include_subfolders_var.set(config.get(f"{self.config_key}_include_subfolders", False))
+                # 新增：加载字幕检查选项
+                self.check_subtitle_var.set(config.get(f"{self.config_key}_check_subtitle", False))
 
                 # 加载排除文件夹列表
                 excluded_folders = config.get(f"{self.config_key}_excluded_folders", [])
@@ -349,6 +368,7 @@ class VideoCheckTab:
             config.update({
                 f"{self.config_key}_folder": self.folder_var.get(),
                 f"{self.config_key}_include_subfolders": self.include_subfolders_var.get(),
+                f"{self.config_key}_check_subtitle": self.check_subtitle_var.get(),
                 f"{self.config_key}_excluded_folders": excluded_folders
             })
 
@@ -431,6 +451,28 @@ class VideoCheckTab:
                 return True
         return False
 
+    def _has_builtin_subtitle(self, video_filename: str) -> bool:
+        """
+        检查视频文件名是否带有内置字幕标记
+
+        规则：文件名（去扩展名）以 -C、-c、-UNC、UC 结尾（不区分大小写）
+        例如: ABC-123-C.mp4, ABC-123-c.mp4, ABC-123-UNC.mp4, ABC-123UC.mp4
+
+        Args:
+            video_filename: 视频文件名（含扩展名）
+
+        Returns:
+            True 表示视为自带字幕，跳过字幕检查
+        """
+        name_no_ext = os.path.splitext(video_filename)[0]
+        # 统一转为大写进行不区分大小写的后缀匹配
+        upper_name = name_no_ext.upper()
+
+        for suffix in self.BUILTIN_SUBTITLE_SUFFIXES:
+            if upper_name.endswith(suffix.upper()):
+                return True
+        return False
+
     def _check_folder(self, folder_path: str) -> List[Dict]:
         """检查单个文件夹，返回问题列表
 
@@ -464,7 +506,7 @@ class VideoCheckTab:
                 all_items = []
 
             # 过滤隐藏项和系统项
-            visible_items = [item for item in all_items 
+            visible_items = [item for item in all_items
                            if not item.startswith('.') and not item.startswith('$')]
 
             # 统计实际文件和子文件夹数量
@@ -528,6 +570,7 @@ class VideoCheckTab:
         # 分类文件
         video_files = []
         image_files = []
+        subtitle_files = []
 
         for file in files:
             if file is None:
@@ -539,6 +582,8 @@ class VideoCheckTab:
                 video_files.append(file)
             elif ext in self.IMAGE_EXTENSIONS:
                 image_files.append(file)
+            elif ext in self.SUBTITLE_EXTENSIONS:
+                subtitle_files.append(file)
 
         # 检查是否缺失视频文件（分类文件夹已在前面过滤）
         if not video_files:
@@ -561,6 +606,35 @@ class VideoCheckTab:
                 "issue_type": "缺失图片",
                 "detail": f"文件夹中未找到封面图片（支持格式: {', '.join(self.IMAGE_EXTENSIONS)}）"
             })
+
+        # ========== 新增：检查字幕文件 ==========
+        if self.check_subtitle_var.get():
+            # 分离出"需要检查字幕"的视频（即不自带字幕的视频）
+            videos_need_subtitle_check = []
+            builtin_subtitle_videos = []
+
+            for video_file in video_files:
+                if self._has_builtin_subtitle(video_file):
+                    builtin_subtitle_videos.append(video_file)
+                else:
+                    videos_need_subtitle_check.append(video_file)
+
+            # 如果存在需要检查字幕的视频，但没有任何字幕文件，则报告缺失字幕
+            if videos_need_subtitle_check and not subtitle_files:
+                # 列出跳过检查的视频信息
+                skipped_info = ""
+                if builtin_subtitle_videos:
+                    skipped_names = ", ".join(builtin_subtitle_videos)
+                    skipped_info = f"；以下视频因文件名含字幕标记已跳过检查: {skipped_names}"
+
+                issues.append({
+                    "folder_path": folder_path,
+                    "file_name": "",
+                    "folder_code": folder_code_display,
+                    "file_code": "",
+                    "issue_type": "缺失字幕",
+                    "detail": f"文件夹中有 {len(videos_need_subtitle_check)} 个视频需要字幕，但未找到字幕文件（.srt）{skipped_info}"
+                })
 
         # 检查视频文件名与文件夹名匹配情况（逐个检查所有视频文件）
         for video_file in video_files:
@@ -627,7 +701,6 @@ class VideoCheckTab:
             # match_level == 2 为强匹配，不记录问题
 
         return issues
-
 
     def _run_check(self):
         """执行检查操作"""
@@ -758,8 +831,8 @@ class VideoCheckTab:
     def _display_results(self, results: List[Dict]):
         """在表格中显示结果"""
         # 按问题类型排序（初始显示顺序）
-        priority = {"番号不匹配": 1, "疑似不匹配": 2, "命名不规范": 3, 
-                   "缺失视频": 4, "缺失图片": 5, "访问错误": 6}
+        priority = {"番号不匹配": 1, "疑似不匹配": 2, "命名不规范": 3,
+                   "缺失视频": 4, "缺失图片": 5, "缺失字幕": 6, "访问错误": 7}
         sorted_results = sorted(results, key=lambda x: priority.get(x['issue_type'], 99))
 
         # 定义标签颜色
@@ -775,7 +848,7 @@ class VideoCheckTab:
                 tag = 'mismatch'
             elif issue['issue_type'] in ['疑似不匹配', '命名不规范']:
                 tag = 'warning'
-            elif issue['issue_type'] in ['缺失视频', '缺失图片']:
+            elif issue['issue_type'] in ['缺失视频', '缺失图片', '缺失字幕']:
                 tag = 'missing'
             elif issue['issue_type'] == '访问错误':
                 tag = 'error'
