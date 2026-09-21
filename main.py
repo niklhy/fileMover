@@ -24,6 +24,7 @@ from file_organize_tab import FileOrganizeTab  # 文件操作tab
 from video_grid_tab import VideoGridTab # 视频缩略图tab
 from video_check_tab import VideoCheckTab   # 视频文件检查
 from file_compare_tab import FileCompareTab # 文件比对tab
+from web_grab_tab import WebGrabTab  # 网页图片抓取tab
 
 class FileMoverGUI:
     """主窗体类 - 选项卡容器和控制器"""
@@ -131,6 +132,11 @@ class FileMoverGUI:
         file_compare_tab = FileCompareTab(self.notebook, controller=self)
         self.tabs['file_compare'] = file_compare_tab
         self.notebook.add(file_compare_tab.frame, text="文件比对(file_compare)")        
+
+        # 网页图片抓取 Tab
+        web_grab_tab = WebGrabTab(self.notebook, controller=self)
+        self.tabs['web_grab'] = web_grab_tab
+        self.notebook.add(web_grab_tab.frame, text="网页抓取(web_grab)")
 
         # 4. 操作日志选项卡（必须最后初始化，因为其他tab可能调用它记录日志）
         log_tab = LogTab(self.notebook, controller=self)

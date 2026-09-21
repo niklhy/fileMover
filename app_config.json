@@ -52,5 +52,10 @@
   "video_check_excluded_folders": [
     "Z:\\下载\\202607\\已下载",
     "Z:\\下载\\202607\\0新下载"
-  ]
+  ],
+  "web_grab": {
+    "max_images": 10,
+    "auto_download": false,
+    "save_path": ""
+  }
 }
