@@ -24,7 +24,7 @@
     ]
   },
   "file_organize": {
-    "source_dir": "X:\\系列\\0アナコンダ(蟒蛇)",
+    "source_dir": "Z:/下载/202607",
     "include_subfolders": true,
     "rename_video": true,
     "rename_subtitle": true,
@@ -36,6 +36,21 @@
     "excluded_dirs": [
       "Z:/下载/202607/0新下载",
       "Z:/下载/202607/已下载"
+    ],
+    "chinese_subtitle_keywords": [
+      "-c",
+      "-ch",
+      "-chinese",
+      "-cn",
+      "-zh"
+    ],
+    "uncensored_keywords": [
+      "-UC",
+      "-UNC",
+      "-Uncensored",
+      "-un",
+      "-破解",
+      "-无码"
     ]
   },
   "move_videos": {
@@ -54,8 +69,116 @@
     "Z:\\下载\\202607\\0新下载"
   ],
   "web_grab": {
-    "max_images": 10,
+    "max_images": 0,
     "auto_download": false,
-    "save_path": ""
+    "save_path": "Z:/下载/202608/z梓まりの(梓玛莉)",
+    "main_image_selector": "div.movie a.bigImage",
+    "sample_image_selector": "div#sample-waterfall",
+    "sample_link_selector": "a.sample-box",
+    "magnet_table_selector": "table#magnet-table",
+    "auto_render_on_missing": true,
+    "magnet_ajax_enabled": true,
+    "magnet_ajax_path": "/ajax/uncledatoolsbyajax.php",
+    "magnet_ajax_params": "gid={gid}&lang={lang}&img={img}&uc={uc}&floor={floor}",
+    "save_path_history": [
+      "Z:/下载/202608/系列",
+      "Z:/下载/202608",
+      "Z:/下载/202608/无系列",
+      "Z:/下载/202608/系列/z製作商：NPJ",
+      "Z:/下载/202608/系列/z製作商：MERCURY（マーキュリー）"
+    ],
+    "field_rules": [
+      {
+        "field_id": "title",
+        "field_name": "标题",
+        "rule_type": "css",
+        "rule_content": "h3",
+        "multiple": false,
+        "enabled": true
+      },
+      {
+        "field_id": "actors",
+        "field_name": "演员",
+        "rule_type": "css",
+        "rule_content": "p span.genre>a",
+        "multiple": true,
+        "enabled": true
+      },
+      {
+        "field_id": "code",
+        "field_name": "番号",
+        "rule_type": "custom",
+        "rule_content": "node = soup.select_one('span[style=\"color:#CC0000;\"]')\nresult = node.text.strip() if node else ''",
+        "multiple": false,
+        "enabled": true
+      },
+      {
+        "field_id": "date",
+        "field_name": "發行日期",
+        "rule_type": "custom",
+        "rule_content": "node = soup.find('span', class_='header', string='發行日期:')\nresult = node.next_sibling.strip() if node and node.next_sibling else ''",
+        "multiple": false,
+        "enabled": true
+      },
+      {
+        "field_id": "duration",
+        "field_name": "長度(秒)",
+        "rule_type": "custom",
+        "rule_content": "node = soup.find('span', class_='header', string='長度:')\ntext = node.next_sibling.strip() if node and node.next_sibling else ''\nhours = re.search(r'(\\d+)\\s*小時', text)\nminutes = re.search(r'(\\d+)\\s*分鐘', text)\ntotal_seconds = 0\nif hours:\n    total_seconds += int(hours.group(1)) * 3600\nif minutes:\n    total_seconds += int(minutes.group(1)) * 60\nresult = total_seconds",
+        "multiple": false,
+        "enabled": true
+      },
+      {
+        "field_id": "series",
+        "field_name": "系列",
+        "rule_type": "custom",
+        "rule_content": "node = soup.find('span', class_='header', string='系列:')\nresult = ''\nif node:\n    sib = node.next_sibling\n    if sib is not None:\n        result = sib.get_text(strip=True) if hasattr(sib, 'get_text') else str(sib).strip()\n    if not result and node.find_next_sibling() is not None:\n        s2 = node.find_next_sibling()\n        result = s2.get_text(strip=True) if hasattr(s2, 'get_text') else str(s2).strip()",
+        "multiple": false,
+        "enabled": true
+      },
+      {
+        "field_id": "publisher",
+        "field_name": "发行商",
+        "rule_type": "custom",
+        "rule_content": "node = soup.find('span', class_='header', string='發行商:')\nresult = ''\nif node:\n    sib = node.next_sibling\n    if sib is not None:\n        result = sib.get_text(strip=True) if hasattr(sib, 'get_text') else str(sib).strip()\n    if not result and node.find_next_sibling() is not None:\n        s2 = node.find_next_sibling()\n        result = s2.get_text(strip=True) if hasattr(s2, 'get_text') else str(s2).strip()",
+        "multiple": false,
+        "enabled": true
+      },
+      {
+        "field_id": "maker",
+        "field_name": "制作商",
+        "rule_type": "custom",
+        "rule_content": "node = soup.find('span', class_='header', string='製作商:')\nresult = ''\nif node:\n    sib = node.next_sibling\n    if sib is not None:\n        result = sib.get_text(strip=True) if hasattr(sib, 'get_text') else str(sib).strip()\n    if not result and node.find_next_sibling() is not None:\n        s2 = node.find_next_sibling()\n        result = s2.get_text(strip=True) if hasattr(s2, 'get_text') else str(s2).strip()",
+        "multiple": false,
+        "enabled": true
+      }
+    ],
+    "multi_link": true,
+    "local_folders": [
+      "Y:/Other/个人专属",
+      "Y:/Other/合集类",
+      "Y:/Other/无系列、不收集系列",
+      "X:/无码",
+      "X:/系列",
+      "Z:/下载"
+    ],
+    "translation_model_dirs": {
+      "nllb-200-distilled-600M": "D:/软件编程/python/练习/20260722-视频语音识别并翻译为字幕/翻译模型/NLLB-200/nllb-200-distilled-600M",
+      "Sakura-7B-Qwen2.5-v1.0-GGUF": "D:/软件编程/python/练习/20260722-视频语音识别并翻译为字幕/翻译模型/SakuraLLM/Sakura-7B-Qwen2.5-v1.0-GGUF",
+      "Sakura-14B-Qwen2.5-v1.0-GGUF": "D:/软件编程/python/练习/20260722-视频语音识别并翻译为字幕/翻译模型/SakuraLLM/Sakura-14B-Qwen2.5-v1.0-GGUF",
+      "Sakura-GalTransl-7B-v3.7": "D:/软件编程/python/练习/20260722-视频语音识别并翻译为字幕/翻译模型/SakuraLLM/Sakura-GalTransl-7B-v3.7"
+    },
+    "translation_model": "Sakura-7B-Qwen2.5-v1.0-GGUF"
+  },
+  "folder_check": {
+    "check_folder": "Z:/下载/202607",
+    "check_include_subfolders": false,
+    "check_check_subtitle": false,
+    "check_excluded_folders": [
+      "Z:\\下载\\202607\\0新下载",
+      "Z:\\下载\\202607\\已下载"
+    ],
+    "compare_source_folder": "F:\\other\\changeDODE\\no\\20260801",
+    "compare_target_folder": "F:\\other\\changeDODE\\OK"
   }
 }

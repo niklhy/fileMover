@@ -11,6 +11,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 import json
 import os
+import sys
 
 # 导入配置和模型
 from config import get_config_path, CONFIG_FILE_NAME
@@ -24,7 +25,10 @@ from file_organize_tab import FileOrganizeTab  # 文件操作tab
 from video_grid_tab import VideoGridTab # 视频缩略图tab
 from video_check_tab import VideoCheckTab   # 视频文件检查
 from file_compare_tab import FileCompareTab # 文件比对tab
-from web_grab_tab import WebGrabTab  # 网页图片抓取tab
+from folder_check_tab import FolderCheckTab  # 文件夹检查/文件比对合并tab
+from web_grab_tab import (  # 网页图片抓取tab
+    WebGrabTab, ensure_cuda_dll_path, translation_env_report,
+)
 
 class FileMoverGUI:
     """主窗体类 - 选项卡容器和控制器"""
@@ -49,6 +53,9 @@ class FileMoverGUI:
         
         # 加载配置到各选项卡
         self._load_config_to_tabs()
+
+        # 关闭主窗口前先清理各选项卡（如释放已载入的翻译模型），再销毁窗口
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
     
     def _load_config(self) -> dict:
         """加载配置文件"""
@@ -133,6 +140,11 @@ class FileMoverGUI:
         self.tabs['file_compare'] = file_compare_tab
         self.notebook.add(file_compare_tab.frame, text="文件比对(file_compare)")        
 
+        # 文件夹检查 / 文件比对 合并 Tab（合并原 video_check 与 file_compare 两个功能）
+        folder_check_tab = FolderCheckTab(self.notebook, controller=self)
+        self.tabs['folder_check'] = folder_check_tab
+        self.notebook.add(folder_check_tab.get_frame(), text="文件夹检查/比对(folder_check)")
+
         # 网页图片抓取 Tab
         web_grab_tab = WebGrabTab(self.notebook, controller=self)
         self.tabs['web_grab'] = web_grab_tab
@@ -147,8 +159,42 @@ class FileMoverGUI:
         # 各选项卡自行管理配置加载，这里可以添加额外的全局配置同步
         pass
 
+    def _on_close(self):
+        """关闭主窗口：先释放各选项卡占用的资源（如翻译模型显存），再销毁窗口"""
+        try:
+            for name, tab in self.tabs.items():
+                cleanup = getattr(tab, 'cleanup', None)
+                if callable(cleanup):
+                    try:
+                        cleanup()
+                    except Exception as e:
+                        print(f"清理选项卡[{name}]资源失败: {e}")
+        except Exception as e:
+            print("清理资源失败:", e)
+        self.root.destroy()
+
+def prepare_translation_env():
+    """准备本地翻译模型的运行环境
+
+    Windows 下 ctranslate2 / llama.dll 需要 cublas、cudnn 等 CUDA 运行库，
+    必须在导入推理库之前把相关目录注册进 DLL 搜索路径，否则 GPU 模式会加载失败。
+    同时输出环境摘要，便于确认 Sakura / NLLB 能否正常载入。
+    """
+    try:
+        ensure_cuda_dll_path()
+        report = translation_env_report()
+        print("翻译环境: " + report)
+        if 'llama_cpp=未安装' in report:
+            print("警告: 当前解释器缺少 llama-cpp-python，Sakura 系列模型无法载入。"
+                  f"当前解释器: Python {sys.version.split()[0]}（{sys.executable}）；"
+                  "请改用已安装该包的解释器启动，例如 py -3.12 main.py")
+    except Exception as e:
+        print("翻译环境准备失败:", e)
+
+
 def main():
     """程序入口"""
+    prepare_translation_env()
     root = tk.Tk()
     app = FileMoverGUI(root)
     root.mainloop()

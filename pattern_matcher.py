@@ -55,10 +55,10 @@ class PatternMatcher:
         self.uncensored_patterns: List[Tuple[re.Pattern, str]] = [
             (re.compile(r'[-_]UC(?=\.|$|[-_])', re.I), '-UC'),            # -UC, _UC
             (re.compile(r'[-_]UNC(?=\.|$|[-_])', re.I), '-UNC'),          # -UNC, _UNC
-            (re.compile(r'[-_]Uncensored(?=\.|$|[-_])', re.I), '-UNC'),   # -Uncensored
-            (re.compile(r'[-_]un(?=\.|$|[-_])', re.I), '-UNC'),           # -un
-            (re.compile(r'[-_]破解(?=\.|$|[-_])'), '-UNC'),               # -破解
-            (re.compile(r'[-_]无码(?=\.|$|[-_])'), '-UNC'),               # -无码
+            # -u、-Uncensored、-un、-ai 统一改为 -Uncensored
+            (re.compile(r'[-_](?:Uncensored|un|u|ai)(?=\.|$|[-_])', re.I), '-Uncensored'),
+            # 其他无码关键词也统一为 -Uncensored，避免生成额外的 -UC/-UNC 后缀
+            (re.compile(r'[-_](?:破解|无码)(?=\.|$|[-_])'), '-Uncensored'),
         ]
 
     def extract_code(self, text: str) -> Optional[Dict]:
@@ -278,7 +278,7 @@ class PatternMatcher:
     def detect_uncensored_suffix(self, filename: str) -> Optional[str]:
         """
         检测文件名中的无码/破解后缀
-        返回标准化的后缀（如 '-UC' 或 '-UNC'），未找到返回 None
+        返回标准化的后缀（'-UC'、'-UNC' 或 '-Uncensored'），未找到返回 None
         """
         stem = Path(filename).stem if '.' in filename else filename
         for pattern, normalized in self.uncensored_patterns:
@@ -289,7 +289,8 @@ class PatternMatcher:
     def detect_all_suffixes(self, filename: str) -> Dict[str, Optional[str]]:
         """
         检测文件名中的所有特殊后缀
-        返回字典：{'chinese_subtitle': '-C' or None, 'uncensored': '-UC'/'-UNC' or None}
+        返回字典：{'chinese_subtitle': '-C' or None,
+                  'uncensored': '-UC'/'-UNC'/'-Uncensored' or None}
         """
         return {
             'chinese_subtitle': self.detect_chinese_subtitle_suffix(filename),
@@ -300,11 +301,13 @@ class PatternMatcher:
                            index: int = 1, total_in_group: int = 1) -> str:
         """
         根据番号和原文件名构建新文件名
-        自动识别并保留中文字幕(-C)和无码(-UC/-UNC)后缀
+        自动识别并保留中文字幕(-C)和无码后缀
 
-        注意：-UC 和 -UNC 中的 C 已包含中文字幕含义，因此不会同时存在 -C-UC 组合
+        注意：-UC 和 -UNC 中的 C 已包含中文字幕含义，因此不会同时存在 -C-UC 组合；
+        -u、-Uncensored、-un、-ai 统一输出为 -Uncensored。
         - 仅中文字幕: 番号-C.mp4
-        - 仅无码: 番号-UC.mp4 或 番号-UNC.mp4 (UC/UNC本身已含中文字幕)
+        - 无码+中文字幕: 番号-UC.mp4 或 番号-UNC.mp4
+        - 其他无码标记: 番号-Uncensored.mp4
         - 无后缀: 番号.mp4
 
         Args:
@@ -348,7 +351,7 @@ class PatternMatcher:
             print(f"添加中文字幕模式失败: {e}")
             return False
 
-    def add_uncensored_pattern(self, pattern_str: str, normalized: str = '-UNC'):
+    def add_uncensored_pattern(self, pattern_str: str, normalized: str = '-Uncensored'):
         """动态添加无码后缀识别模式"""
         try:
             compiled = re.compile(pattern_str, re.I)

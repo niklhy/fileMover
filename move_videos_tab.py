@@ -759,38 +759,38 @@ class MoveVideosTab:
                 self.log(f"获取视频文件失败: {e}")
         return video_files
 
-    def quick_move_file(self, source_path: Path, target_folder: Path) -> Tuple[bool, Optional[Path], str]:
-        """快速移动文件 - 直接使用shutil.move，速度极快
+    def quick_move_file(self, source_path: Path, target_folder: Path) -> Tuple[bool, Optional[Path], str, bool]:
+        """快速移动文件
         
         Returns:
-            (success: bool, dest_path: Optional[Path], error_message: str)
+            (success, dest_path, error_message, was_renamed)
         """
         try:
-            # 确保目标文件夹存在
             target_folder.mkdir(parents=True, exist_ok=True)
 
-            # 确定目标文件路径（处理重名）
             dest_file = target_folder / source_path.name
+            was_renamed = False
             counter = 1
             stem, suffix = dest_file.stem, dest_file.suffix
             while dest_file.exists():
+                # 检查是否为完全相同的文件
+                try:
+                    if dest_file.stat().st_size == source_path.stat().st_size:
+                        return True, dest_file, "目标已存在相同文件", False
+                except:
+                    pass
                 dest_file = target_folder / f"{stem}_{counter}{suffix}"
                 counter += 1
+                was_renamed = True
 
-            # 直接使用shutil.move - 同磁盘重命名，跨磁盘复制+删除，都很快
             shutil.move(str(source_path), str(dest_file))
-            
-            return True, dest_file, ""
+            return True, dest_file, "", was_renamed
 
         except Exception as e:
-            return False, None, str(e)
+            return False, None, str(e), False
 
     def move_subtitles(self, video_path: Path, target_folder: Path) -> List[Path]:
-        """移动与视频文件匹配的字幕文件
-        
-        根据视频文件名匹配同目录下的字幕文件（.srt/.ass/.ssa），
-        文件名以视频文件stem开头的字幕文件将被一同移动到目标文件夹。
-        """
+        """移动字幕文件"""
         moved = []
         source_dir = video_path.parent
         video_stem = video_path.stem.lower()
@@ -802,12 +802,14 @@ class MoveVideosTab:
                 continue
 
             sub_stem = sub_file.stem.lower()
-            # 字幕文件名以视频文件stem开头（如 video.srt, video.chs.srt）
             if sub_stem.startswith(video_stem):
-                success, dest_path, error_msg = self.quick_move_file(sub_file, target_folder)
+                success, dest_path, error_msg, was_renamed = self.quick_move_file(sub_file, target_folder)
                 if success:
                     moved.append(dest_path)
-                    self.log(f"  [字幕移动] {sub_file.name} -> {target_folder.name}")
+                    if was_renamed:
+                        self.log(f"  [字幕重命名] {sub_file.name} -> {dest_path.name} (目标已存在同名)")
+                    else:
+                        self.log(f"  [字幕移动] {sub_file.name} -> {target_folder.name}")
                 else:
                     self.log(f"  [字幕移动失败] {sub_file.name}: {error_msg}")
 
@@ -927,32 +929,27 @@ class MoveVideosTab:
                 continue
 
             # 执行快速移动（在后台线程直接操作，不阻塞）
-            success, dest_path, error_msg = self.quick_move_file(video_file, best_match)
-            
+            success, dest_path, error_msg, was_renamed = self.quick_move_file(video_file, best_match)
+
             if success:
-                # 移动成功，立即添加到列表显示（状态为"验证中"）
                 stats['verifying'] += 1
                 item_id = f"ITEM_{index}_{int(time.time() * 1000)}"
-                
-                # 主线程更新UI
                 self.frame.after(0, self._add_verifying_record, item_id, video_file, dest_path, best_match.name)
-                
-                # 提交异步验证任务（后台验证文件完整性）
                 self.verify_worker.submit_verify(item_id, video_file, dest_path)
                 
-                self.log(f"[移动完成-待验证] {video_file.name} -> {best_match.name}")
+                if was_renamed:
+                    self.log(f"⚠️ [重命名] {video_file.name} -> {dest_path.name} (目标文件夹已存在同名文件)")
+                else:
+                    self.log(f"[移动完成-待验证] {video_file.name} -> {best_match.name}")
 
-                # 同时移动匹配的字幕文件
                 moved_subs = self.move_subtitles(video_file, best_match)
                 if moved_subs:
                     self.log(f"  [字幕] 共移动 {len(moved_subs)} 个字幕文件")
             else:
-                # 移动立即失败
                 stats['failed'] += 1
                 self.log(f"[移动失败] {video_file.name}: {error_msg}")
                 self.frame.after(0, self._add_failed_record, video_file, best_match.name, error_msg)
             
-            # 每10个文件更新一次进度，减少UI负担
             # 每10个文件更新一次进度，减少UI负担
             if index % 10 == 0 or index == total_files:
                 self.update_progress(progress, f"处理 {index}/{total_files}: {video_file.name[:30]}...", 

@@ -13,7 +13,7 @@
 7. 统一JSON配置管理（多Tab共享）
 8. 排除文件夹功能 - 可设置多个排除目录，遍历时跳过
 9. 【新增】中文字幕后缀识别（-c, -ch等，可配置）
-10. 【新增】无码后缀保留（-UC, -UNC等，不再强制改为-Uncensored）
+10. 【新增】无码后缀识别：-UC/-UNC 保留原后缀；-u/-Uncensored/-un/-ai 统一为 -Uncensored
 """
 
 import tkinter as tk
@@ -93,6 +93,8 @@ except ImportError:
             patterns = [
                 (re.compile(r'[-_]UC(?=\.|$|[-_])', re.I), '-UC'),
                 (re.compile(r'[-_]UNC(?=\.|$|[-_])', re.I), '-UNC'),
+                (re.compile(r'[-_](?:Uncensored|un|u|ai)(?=\.|$|[-_])', re.I), '-Uncensored'),
+                (re.compile(r'[-_](?:破解|无码)(?=\.|$|[-_])'), '-Uncensored'),
             ]
             for pattern, normalized in patterns:
                 if pattern.search(stem):
@@ -110,10 +112,10 @@ except ImportError:
             ext = Path(original_filename).suffix
             suffixes = self.detect_all_suffixes(original_filename)
             suffix_part = ''
-            if suffixes['chinese_subtitle']:
-                suffix_part += suffixes['chinese_subtitle']
             if suffixes['uncensored']:
                 suffix_part += suffixes['uncensored']
+            elif suffixes['chinese_subtitle']:
+                suffix_part += suffixes['chinese_subtitle']
             if total_in_group > 1:
                 return f"{code}{suffix_part}-{index}{ext}"
             else:
@@ -124,6 +126,8 @@ VIDEO_EXTENSIONS: Set[str] = {'.avi', '.mp4', '.ts', '.rmvb', '.rm', '.mkv', '.m
 IMAGE_EXTENSIONS: Set[str] = {'.jpg', '.jpeg', '.png', '.gif', '.tiff', '.webp', '.bmp'}
 CONVERTIBLE_EXTENSIONS: Set[str] = {'.webp', '.bmp'}
 DELETE_EXTENSIONS: Set[str] = {'.torrent', '.lnk'}
+# 受保护、清理时绝不删除的文件类型（如记录视频数据的 JSON：文件名一般为「{番号}.json」）
+PROTECTED_EXTENSIONS: Set[str] = {'.json'}
 SUBTITLE_EXTENSIONS: Set[str] = {'.srt', '.ass', '.ssa', '.vtt', '.sub', '.idx'}
 
 # 正则表达式（仅用于界面显示等非核心匹配功能）
@@ -136,7 +140,7 @@ CONFIG_FILE_NAME = "app_config.json"
 DEFAULT_CHINESE_SUBTITLE_KEYWORDS = ['-c', '-ch', '-chinese', '-cn', '-zh']
 
 # 【新增】默认无码后缀关键词（可配置）
-DEFAULT_UNCENSORED_KEYWORDS = ['-UC', '-UNC', '-Uncensored', '-un', '-破解', '-无码']
+DEFAULT_UNCENSORED_KEYWORDS = ['-UC', '-UNC', '-u', '-Uncensored', '-un', '-ai', '-破解', '-无码']
 
 
 # ========== 统一配置管理器 ==========
@@ -323,19 +327,24 @@ class FileOrganizeWorker:
         for keyword in self.config.uncensored_keywords:
             if not keyword:
                 continue
-            escaped = re.escape(keyword)
-            pattern_str = f'[-_]?{escaped}(?=\\.|$|[-_])'
+            normalized_keyword = keyword.strip().lstrip('-_').lower()
+            if not normalized_keyword:
+                continue
+            escaped = re.escape(normalized_keyword)
+            pattern_str = f'[-_]{escaped}(?=\\.|$|[-_])'
             exists = False
             for p, _ in self.matcher.uncensored_patterns:
-                if keyword.lower() in p.pattern.lower():
+                if normalized_keyword in p.pattern.lower():
                     exists = True
                     break
             if not exists:
-                # 根据关键词确定标准化后缀
-                if 'uc' in keyword.lower() and 'unc' not in keyword.lower():
+                # 仅 -UC/-UNC 保留原后缀，其余无码关键词统一为 -Uncensored
+                if normalized_keyword == 'uc':
                     normalized = '-UC'
-                else:
+                elif normalized_keyword == 'unc':
                     normalized = '-UNC'
+                else:
+                    normalized = '-Uncensored'
                 self.matcher.add_uncensored_pattern(pattern_str, normalized)
 
     def stop(self):
@@ -412,7 +421,8 @@ class FileOrganizeWorker:
         【修改】重命名视频文件
         使用 PatternMatcher 统一检测后缀：
         - 中文字幕：-c, -ch 等 -> 保留为 -C
-        - 无码：-UC, -UNC 等 -> 保留原样（不再强制改为 -Uncensored）
+        - -UC, -UNC -> 保留原后缀并转为大写
+        - -u, -Uncensored, -un, -ai -> -Uncensored
         """
         # 使用 PatternMatcher 检测所有后缀
         suffixes = self.matcher.detect_all_suffixes(video_path.name)
@@ -424,8 +434,9 @@ class FileOrganizeWorker:
             # -UC 或 -UNC 已包含中文字幕含义
             suffix_part += suffixes['uncensored']
             self.stats['uncensored_count'] += 1
-            # UC/UNC 包含中文字幕，同时增加中文字幕计数
-            self.stats['chinese_subtitle_count'] += 1
+            # 仅 UC/UNC 中的 C 代表中文字幕，其他无码后缀不计入中文字幕
+            if suffixes['uncensored'] in ('-UC', '-UNC'):
+                self.stats['chinese_subtitle_count'] += 1
         elif suffixes['chinese_subtitle']:
             # 仅中文字幕
             suffix_part += suffixes['chinese_subtitle']
@@ -472,7 +483,7 @@ class FileOrganizeWorker:
     def rename_subtitle(self, subtitle_path: Path, new_stem: str, index: int, total_in_group: int = 1) -> Optional[Path]:
         """
         【修改】重命名字幕文件
-        后缀规则与视频文件保持一致（-C, -UC, -UNC 等）
+        字幕使用调用方已按自身文件名计算好的 new_stem
         """
         if total_in_group > 1:
             new_name = f"{new_stem}-{index}{subtitle_path.suffix}"
@@ -537,6 +548,10 @@ class FileOrganizeWorker:
             return None
 
     def delete_file(self, file_path: Path) -> bool:
+        # 受保护类型（如记录视频数据的 {番号}.json）绝不删除，即使在垃圾删除范围内
+        if file_path.suffix.lower() in PROTECTED_EXTENSIONS:
+            self.log(f"  [保留] 不删除受保护文件: {file_path.name}")
+            return False
         if self.config.dry_run:
             self.log(f"  [试运行] 将删除: {file_path.name}")
             return True
@@ -638,27 +653,19 @@ class FileOrganizeWorker:
                 if result is None and not self.config.dry_run:
                     has_rename_error = True
 
-        # 处理字幕文件（与视频同步重命名）
-        # 【修改】使用 PatternMatcher 检测后缀，保持与视频一致
+        # 处理字幕文件
+        # 每个字幕文件按自身文件名检测后缀，避免错误继承视频的 -UC/-UNC 等后缀
         if subtitles and self.config.rename_subtitle and has_valid_code:
-            # 从第一个视频检测后缀（如果有视频）
-            # 注意：-UC 和 -UNC 中的 C 已包含中文字幕含义，不会同时存在 -C-UC 组合
-            suffix_part = ''
-            if videos:
-                first_video = sorted_videos[0]
-                suffixes = self.matcher.detect_all_suffixes(first_video.name)
-                if suffixes['uncensored']:
-                    # -UC 或 -UNC 已包含中文字幕含义
-                    suffix_part += suffixes['uncensored']
-                elif suffixes['chinese_subtitle']:
-                    # 仅中文字幕
-                    suffix_part += suffixes['chinese_subtitle']
-
-            new_stem = f"{code}{suffix_part}"
-
             for idx, subtitle_path in enumerate(sorted_subtitles, 1):
                 if not self.is_running:
                     return
+                suffixes = self.matcher.detect_all_suffixes(subtitle_path.name)
+                suffix_part = ''
+                if suffixes['uncensored']:
+                    suffix_part = suffixes['uncensored']
+                elif suffixes['chinese_subtitle']:
+                    suffix_part = suffixes['chinese_subtitle']
+                new_stem = f"{code}{suffix_part}"
                 result = self.rename_subtitle(subtitle_path, new_stem, idx, total_videos)
                 if result is None and not self.config.dry_run:
                     has_rename_error = True
@@ -880,8 +887,9 @@ class FileOrganizeTab:
             "2. 重命名视频文件为番号格式（多文件自动添加-1,-2后缀）\n"
             "3. 自动识别并保留后缀：\n"
             "   - 中文字幕：-c, -ch 等 -> 保留为 -C\n"
-            "   - 无码+中文字幕：-UC, -UNC -> 保留原样（C已含中文字幕含义）\n"
-            "4. 同步重命名字幕文件（.srt/.ass/.ssa/.vtt/.sub/.idx），命名规则与视频一致\n"
+            "   - 无码+中文字幕：-UC, -UNC -> 保留原后缀并转为大写（C已含中文字幕含义）\n"
+            "   - 其他无码标记：-u, -Uncensored, -un, -ai -> -Uncensored\n"
+            "4. 重命名字幕文件（.srt/.ass/.ssa/.vtt/.sub/.idx），字幕按自身文件名识别后缀\n"
             "5. 仅在识别到有效番号时，才将图片重命名为cover.jpg\n"
             "6. 自动转换webp、bmp格式为jpg\n"
             "7. 删除torrent、lnk等垃圾文件\n"
@@ -947,10 +955,10 @@ class FileOrganizeTab:
         self.uncensored_keywords_var = tk.StringVar(value=', '.join(self.uncensored_keywords))
         uncensored_entry = ttk.Entry(uncensored_frame, textvariable=self.uncensored_keywords_var, width=40)
         uncensored_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
-        ttk.Label(uncensored_frame, text="(用逗号分隔，如: -UC, -UNC)", foreground="gray").pack(side=tk.LEFT)
+        ttk.Label(uncensored_frame, text="(如: -UC, -UNC, -u, -Uncensored, -un, -ai)", foreground="gray").pack(side=tk.LEFT)
 
         # 说明标签
-        ttk.Label(suffix_frame, text="检测到这些后缀时将保留在新文件名中，如: 番号-C.mp4 (中文字幕), 番号-UC.mp4 (无码+中文字幕)",
+        ttk.Label(suffix_frame, text="后缀规则: -UC/-UNC保留原后缀；-u/-Uncensored/-un/-ai统一为-Uncensored",
                  foreground="blue").pack(padx=10, pady=(0, 5))
 
         # 操作选项
