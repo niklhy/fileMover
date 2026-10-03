@@ -23,12 +23,12 @@ from log_tab import LogTab
 from file_move_tab import FileMoveTab
 from file_organize_tab import FileOrganizeTab  # 文件操作tab
 from video_grid_tab import VideoGridTab # 视频缩略图tab
-from video_check_tab import VideoCheckTab   # 视频文件检查
-from file_compare_tab import FileCompareTab # 文件比对tab
-from folder_check_tab import FolderCheckTab  # 文件夹检查/文件比对合并tab
+from folder_check_tab import FolderCheckTab  # 文件夹检查/文件比对合并tab（含原 video_check 与 file_compare 功能）
 from web_grab_tab import (  # 网页图片抓取tab
     WebGrabTab, ensure_cuda_dll_path, translation_env_report,
 )
+# 顶部外部工具按钮区（可在外部工具管理窗口中修改脚本路径）
+from external_tool_launcher import ExternalToolLauncher
 
 class FileMoverGUI:
     """主窗体类 - 选项卡容器和控制器"""
@@ -36,15 +36,24 @@ class FileMoverGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("文件移动工具 - 模块化版本")
-        self.root.geometry("1200x950")
+        # 默认窗口尺寸：高度按屏幕自适应加高（不超过屏幕高度），保证底部操作按钮打开即可见
+        screen_h = self.root.winfo_screenheight()
+        win_h = min(1100, max(950, screen_h - 100))
+        self.root.geometry(f"1200x{win_h}")
         
         # 配置存储
         self.config = self._load_config()
         
         # 创建Notebook（选项卡容器）
         self.notebook = ttk.Notebook(self.root)
-        self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        
+
+        # 顶部按钮区：外部 Python 工具（脚本路径可在“管理脚本”窗口中修改）
+        self.toolbar = ExternalToolLauncher(self.root, controller=self)
+        self.toolbar.frame.pack(fill=tk.X, padx=10, pady=(10, 4))
+
+        # Notebook 放在按钮区下方
+        self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+
         # 存储选项卡实例（便于后续扩展访问）
         self.tabs = {}
         
@@ -114,7 +123,7 @@ class FileMoverGUI:
         # 1. 文件移动 Tab（嵌入模式）
         file_move_tab = FileMoveTab(self.notebook, controller=self, show_log_panel=False)
         self.tabs['file_move'] = file_move_tab
-        self.notebook.add(file_move_tab.frame, text="文件夹下移动")
+        self.notebook.add(file_move_tab.frame, text="文件夹下移动(file_move_tab)")
     
         # 2. 移动新视频选项卡（核心功能）
         move_tab = MoveVideosTab(self.notebook, controller=self)
@@ -128,18 +137,8 @@ class FileMoverGUI:
         # 视频宫格缩略图 Tab
         grid_tab = VideoGridTab(self.notebook, controller=self)
         self.tabs['video_grid'] = grid_tab
-        self.notebook.add(grid_tab.frame, text="视频缩略图")        
+        self.notebook.add(grid_tab.frame, text="视频缩略图(video_grid)")        
         
-        # 视频文件检查 Tab
-        video_check_tab = VideoCheckTab(self.notebook, controller=self)
-        self.tabs['video_check'] = video_check_tab
-        self.notebook.add(video_check_tab.frame, text="视频文件检查(video_check)")
-
-        # 文件比对 Tab
-        file_compare_tab = FileCompareTab(self.notebook, controller=self)
-        self.tabs['file_compare'] = file_compare_tab
-        self.notebook.add(file_compare_tab.frame, text="文件比对(file_compare)")        
-
         # 文件夹检查 / 文件比对 合并 Tab（合并原 video_check 与 file_compare 两个功能）
         folder_check_tab = FolderCheckTab(self.notebook, controller=self)
         self.tabs['folder_check'] = folder_check_tab

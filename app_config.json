@@ -71,7 +71,7 @@
   "web_grab": {
     "max_images": 0,
     "auto_download": false,
-    "save_path": "Z:/下载/202608/z梓まりの(梓玛莉)",
+    "save_path": "Z:\\下载\\202608\\系列\\z製作商：豊彦\\SEX依存症の女)",
     "main_image_selector": "div.movie a.bigImage",
     "sample_image_selector": "div#sample-waterfall",
     "sample_link_selector": "a.sample-box",
@@ -81,11 +81,16 @@
     "magnet_ajax_path": "/ajax/uncledatoolsbyajax.php",
     "magnet_ajax_params": "gid={gid}&lang={lang}&img={img}&uc={uc}&floor={floor}",
     "save_path_history": [
-      "Z:/下载/202608/系列",
-      "Z:/下载/202608",
+      "Z:\\下载\\202608\\系列\\z製作商：豊彦\\SEX依存症の女)",
+      "Z:\\下载\\202608\\系列\\z製作商：豊彦\\无系列",
+      "Z:\\下载\\202608\\系列\\z製作商：豊彦\\s射精制服美少女",
+      "Z:/下载/202608/系列\\z製作商：豊彦\\无系列",
+      "Z:/下载/202608/c潮崎ななみ(潮崎七海)",
+      "Z:/下载/202608/q七沢みあ(七泽美亚)",
+      "Z:/下载/202608/q七ツ森りり(七森莉莉)",
       "Z:/下载/202608/无系列",
-      "Z:/下载/202608/系列/z製作商：NPJ",
-      "Z:/下载/202608/系列/z製作商：MERCURY（マーキュリー）"
+      "Z:/下载/202608/b白河花清",
+      "Z:/下载/202608/h河合あすな(河合明日菜)"
     ],
     "field_rules": [
       {
@@ -168,7 +173,61 @@
       "Sakura-14B-Qwen2.5-v1.0-GGUF": "D:/软件编程/python/练习/20260722-视频语音识别并翻译为字幕/翻译模型/SakuraLLM/Sakura-14B-Qwen2.5-v1.0-GGUF",
       "Sakura-GalTransl-7B-v3.7": "D:/软件编程/python/练习/20260722-视频语音识别并翻译为字幕/翻译模型/SakuraLLM/Sakura-GalTransl-7B-v3.7"
     },
-    "translation_model": "Sakura-7B-Qwen2.5-v1.0-GGUF"
+    "translation_model": "Sakura-GalTransl-7B-v3.7",
+    "list_url_library": [
+      "https://www.busfan.cyou/",
+      "https://www.javbus.com",
+      "https://www.javbus.casa",
+      "https://www.dmmbus.casa",
+      "https://www.dmmsee.casa",
+      "https://www.seedmm.casa",
+      "https://www.busfan.casa",
+      "https://www.busjav.casa",
+      "https://www.buscdn.casa",
+      "https://www.busdmm.casa",
+      "https://www.cdnbus.casa"
+    ],
+    "list_container_selector": "div#waterfall",
+    "list_item_selector": "div.movie-box, a.movie-box",
+    "list_thumb_selector": "div.photo-frame img@src",
+    "list_title_selector": "div.photo-frame img@title",
+    "list_code_selector": "div.photo-info date, div.photo-info span",
+    "list_date_selector": "div.photo-info date, div.photo-info span",
+    "list_flag_selector": "div.item-tag button, span.movie-box-hd",
+    "list_link_selector": "a@href",
+    "list_next_selector": "a#next",
+    "list_alert_selector": "div.alert.alert-info.alert-dismissable.alert-common",
+    "list_page_template": "https://www.busfan.cyou/page/{page}",
+    "list_auto_collect": true,
+    "list_render_js": false,
+    "list_config_version": 3,
+    "list_last_url": "https://www.javbus.casa/studio/eo",
+    "list_last_page": 75,
+    "list_tabs": [
+      {
+        "name": "全部列表",
+        "url": "https://www.busfan.cyou/page/165",
+        "page": 165
+      },
+      {
+        "name": "拘束类型",
+        "url": "https://www.javbus.casa/genre/3p/75",
+        "page": 75
+      },
+      {
+        "name": "制作商-豊彦",
+        "url": "https://www.javbus.casa/studio/eo",
+        "page": 1
+      }
+    ],
+    "list_active_tab": 2,
+    "list_search_path": "/search/{keyword}",
+    "list_active_host": "https://www.javbus.casa",
+    "list_pages_shown": "1",
+    "list_wildcard_pad": "",
+    "local_folder_scopes": {
+      "X:\\系列": "series"
+    }
   },
   "folder_check": {
     "check_folder": "Z:/下载/202607",
@@ -178,7 +237,47 @@
       "Z:\\下载\\202607\\0新下载",
       "Z:\\下载\\202607\\已下载"
     ],
-    "compare_source_folder": "F:\\other\\changeDODE\\no\\20260801",
-    "compare_target_folder": "F:\\other\\changeDODE\\OK"
+    "compare_source_folder": "F:\\other\\changeDODE\\no\\20260802",
+    "compare_target_folder": "F:\\other\\changeDODE\\OK",
+    "compare_recursive": false,
+    "compare_video_only": true,
+    "compare_source_history": [
+      "F:\\other\\changeDODE\\no\\20260802",
+      "F:\\other\\changeDODE\\no\\20260801"
+    ],
+    "compare_target_history": [
+      "F:\\other\\changeDODE\\OK",
+      "Z:/下载/202608/0已下载"
+    ]
+  },
+  "video_transcode": {
+    "save_mode": "custom",
+    "save_dir": "F:/other/changeDODE/OK",
+    "resolution": "1280x720",
+    "orientation": "横向",
+    "aspect": "保持原比例",
+    "bitrate": 1000,
+    "concurrency": 3,
+    "after_done": "无操作",
+    "precision": "0.1S",
+    "ffmpeg_path": "C:\\Program Files\\ffmpeg\\bin\\ffmpeg.EXE",
+    "encoder": "auto",
+    "subtitle": "软字幕·封装（随转码）",
+    "del_src": false,
+    "del_srt": true,
+    "overwrite_src": true
+  },
+  "external_tools": {
+    "tools": [
+      {
+        "id": "subtitle_tool",
+        "name": "语音识别字幕",
+        "python": "",
+        "script": "D:\\软件编程\\python\\练习\\20260722-视频语音识别并翻译为字幕\\run.py",
+        "cwd": "",
+        "args": "",
+        "console": true
+      }
+    ]
   }
 }

@@ -1,0 +1,14 @@
+{
+  "video_folder": "",
+  "target_folder": "",
+  "include_subfolders": false,
+  "file_move_tab": {
+    "directory": "",
+    "mode": "flatten",
+    "all_subfolders": false,
+    "only_video": true,
+    "dry_run": true,
+    "folder_b": "F:\\other\\changeDODE\\no\\20260802",
+    "finish_action": "none"
+  }
+}

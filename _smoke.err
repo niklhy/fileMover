@@ -1,0 +1,21 @@
+Exception in Tkinter callback
+Traceback (most recent call last):
+  File "C:\Users\niklh\AppData\Local\Programs\Python\Python314\Lib\tkinter\__init__.py", line 2093, in __call__
+    return self.func(*args)
+           ~~~~~~~~~^^^^^^^
+  File "C:\Users\niklh\AppData\Local\Programs\Python\Python314\Lib\tkinter\__init__.py", line 876, in callit
+    func(*args, **kw)
+    ~~~~^^^^^^^^^^^^^
+  File "D:\软件编程\python\练习\20260915-视频文件管理工具\_genre_smoke_test.py", line 207, in wait
+    obj._genre_layer_on_click(2, 5)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "D:\软件编程\python\练习\20260915-视频文件管理工具\web_grab_tab.py", line 8810, in _genre_layer_on_click
+    self._genre_layer_open_selection()
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "D:\软件编程\python\练习\20260915-视频文件管理工具\web_grab_tab.py", line 8890, in _genre_layer_open_selection
+    self._list_tab_open_url(url, name=tab_name)
+    ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
+  File "D:\软件编程\python\练习\20260915-视频文件管理工具\web_grab_tab.py", line 5126, in _list_tab_open_url
+    index = next((i for i, tab in enumerate(self.list_tabs)
+                                            ^^^^^^^^^^^^^^
+AttributeError: 'WebGrabTab' object has no attribute 'list_tabs'

@@ -1,5 +1,31 @@
 继续优化容器UI：
 
+
+
+2、当前窗口添加了用于检索视频的文件夹列表添加功能，在此基础上修改为，在添加文件夹时可设置对应的范围，选项是单选“系列”。已设置的文件夹的范围需要在列表上增加一列显示，且可修改。即A文件夹如不设置则默认是全部，B文件夹勾选了“系列”则显示为“系列”；
+3、在主窗口对视频进行“检索视频”操作时，当前是会采用按“番号/演员名/系列名”三个维度同时对所有文件夹进行搜索，但由于有些系列名可能会与其它个人视频文件夹名相似页被搜索出来，为提高检索可读性，现在修改为：“番号/演员名”的搜索是对所有已设定文件夹进行搜索；“系列名”的搜索只对已设置文件夹里勾远了“系列”范围的文件夹进行检索。
+4、为实现上面的类型，在做文件夹索引时，需要把文件夹有“系列”标记的进行单独分类，用于后续对"系列名"进行检索；
+
+
+
+增加新功能：
+1、在进行视频详情字段抓取时，增加对视频类别的抓取，以网址“https://www.busfan.cyou/ABF-358”为例，该字段在网页中的代码为：
+<p class="header">類別:<span id="genre-toggle" class="glyphicon glyphicon-plus" style="cursor: pointer;"></span></p>
+<p>            <span class="genre"><label><input type="checkbox" name="gr_sel" value="3n"><a href="https://www.busfan.cyou/genre/3n">乳房</a></label></span>
+                        <span class="genre"><label><input type="checkbox" name="gr_sel" value="e"><a href="https://www.busfan.cyou/genre/e">巨乳</a></label></span>
+                        <span class="genre"><label><input type="checkbox" name="gr_sel" value="f"><a href="https://www.busfan.cyou/genre/f">單體作品</a></label></span>
+                        <span class="genre"><label><input type="checkbox" name="gr_sel" value="gt"><a href="https://www.busfan.cyou/genre/gt">ローション?オイル</a></label></span>
+                        <span class="genre"><label><input type="checkbox" name="gr_sel" value="hy"><a href="https://www.busfan.cyou/genre/hy">フルハイビジョン(FHD)</a></label></span>
+                        <span class="genre"><label><input type="checkbox" name="gr_sel" value="i9"><a href="https://www.busfan.cyou/genre/i9">オモチャ</a></label></span>
+            <span class="genre"><button id="gr_btn" type="button" class="btn">多選提交</button></span>
+            </p>
+在这段代码中，每个label中a标签的文字是类别名，同时记录a标签的href属性值，即类别的网址。
+2、标签在窗口左侧的“发行间”和“制作商”下方增加“类别”字段行，把每个类别名都列出，超出一行可换行显示。每个类别都匹配回原始的链接，点击可在视频列表页打开对应的类别页面，参考点击“系列”字段的操作；在网页代码中可以点击“類別:”标题后面的符号，从页在选择类别时，切换单选或多选。如果是多选多个类别，是把同时满足多个类别的标签组合成新网址并打开；参考源代码中“單體作品”对应标签代码是“f”，“ローション?オイル”对应标签代码是“gt”，所以如果多选这两个类别并打开网址，最后生成的网址是“https://www.busfan.cyou/genre/f-gt”，即最后面的“f-gt”。
+3、当点击“创建视频文件夹”按钮时，在创建的json文件数据中，增加视频的所有类别名信息，并且把对应的标签代码也同时进行匹配；
+
+
+
+
 首次检索视频时，在软件文件夹下生成临时数据文件，保存扫描过的文件夹番号和路径信息，请自行分析决定使用字典键值对还是使用json格式。以及分析保存为json文件还是保存到软件缓存。之后的搜索则直接通过缓存或json文件进行搜索。提高后续搜索速度。
 
 点击磁力连表格中的行（非标题列）时，把对应行的标题列完整内容显示到日志中。

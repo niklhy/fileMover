@@ -164,24 +164,40 @@ class ConfigManager:
         self.config_path = config_path or self._get_default_config_path()
         self._config: Dict[str, Any] = {}
         self._callbacks: Dict[str, List[Callable]] = defaultdict(list)
+        self._dirty_sections: Set[str] = set()
         self._load_config()
 
     def _get_default_config_path(self) -> str:
         return os.path.join(os.path.dirname(os.path.abspath(__file__)), CONFIG_FILE_NAME)
 
-    def _load_config(self):
+    def _read_disk(self) -> Dict[str, Any]:
+        """读取磁盘上的最新配置内容"""
         try:
             if os.path.exists(self.config_path):
                 with open(self.config_path, 'r', encoding='utf-8') as f:
-                    self._config = json.load(f)
-            else:
-                self._config = {}
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    return data
         except Exception as e:
-            print(f"加载配置失败: {e}")
-            self._config = {}
+            print(f"读取配置失败: {e}")
+        return {}
+
+    def _load_config(self):
+        self._config = self._read_disk()
 
     def save_config(self, show_error: bool = False) -> bool:
+        """写盘前先与磁盘最新内容合并，只覆盖本实例改动过的分区。
+
+        原因：file_organize_tab / web_grab_tab / video_grid_tab 各自持有独立的
+        单例，却共用同一个 app_config.json；直接写回整份内存副本会互相覆盖。
+        """
         try:
+            merged = self._read_disk()
+            for section in self._dirty_sections:
+                if section in self._config:
+                    merged[section] = self._config[section]
+            self._config = merged
+            self._dirty_sections.clear()
             config_dir = os.path.dirname(self.config_path)
             if config_dir and not os.path.exists(config_dir):
                 os.makedirs(config_dir)
@@ -203,16 +219,24 @@ class ConfigManager:
             self._config[section] = {}
         old_value = self._config[section].get(key)
         self._config[section][key] = value
+        self._dirty_sections.add(section)
         if old_value != value:
             self._trigger_callbacks(section, key, value)
         if auto_save:
             self.save_config()
 
     def get_section(self, section: str, default: Optional[Dict] = None) -> Dict:
+        """读取分区时以磁盘最新内容为准，避免读到旧副本"""
+        disk = self._read_disk()
+        if section in disk:
+            self._config[section] = disk[section]
+            return disk[section]
         return self._config.get(section, default or {})
 
     def set_section(self, section: str, data: Dict, auto_save: bool = True):
+        self._config = self._read_disk()
         self._config[section] = data
+        self._dirty_sections = {section}
         if auto_save:
             self.save_config()
 
