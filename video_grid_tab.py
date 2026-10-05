@@ -1363,6 +1363,151 @@ class TimeEntry(tk.Entry):
         return 'break'
 
 
+class TrimRangeBar(tk.Canvas):
+    """剪辑范围双滑块条（同时充当进度条）：前（左）滑块=开始时间，后（右）滑块=结束时间。
+
+    - 拖动某个滑块 -> 回调 on_drag(which, t)，画面跟随该滑块时间
+    - 单击某个滑块 -> 回调 on_select(which)，之后时间微调按钮/方向键作用于它
+    - 单击/拖动轨道空白区 -> 回调 on_seek(t) 定位播放（充当原进度条的拖动定位）
+    - 红色游标实时显示当前播放位置；两个滑块之间区域以蓝色高亮，选中滑块加粗高亮
+    """
+
+    HANDLE_W = 10     # 滑块手柄半宽（像素）
+    HIT_PX = 14       # 命中判定范围（像素）
+    PAD = 6           # 两端留白
+
+    def __init__(self, master, on_select=None, on_drag=None, on_seek=None, **kw):
+        kw.setdefault('height', 30)
+        super().__init__(master, highlightthickness=0, **kw)
+        self._on_select_cb = on_select
+        self._on_drag_cb = on_drag
+        self._on_seek_cb = on_seek
+        self._dur = 0.0
+        self._start = 0.0
+        self._end = 0.0
+        self._pos = 0.0      # 当前播放位置（红色游标）
+        self._active = 'start'
+        self._dragging = None            # 正在拖动的滑块 'start' / 'end' / None
+        self.bind('<Configure>', lambda e: self.redraw())
+        self.bind('<ButtonPress-1>', self._on_press)
+        self.bind('<B1-Motion>', self._on_motion)
+        self.bind('<ButtonRelease-1>', self._on_release)
+
+    # ---- 数据 ----
+    def set_active(self, which: str):
+        """切换选中（激活）的滑块，不触发回调"""
+        if which in ('start', 'end') and which != self._active:
+            self._active = which
+            self.redraw()
+
+    def set_values(self, dur: float, start: float, end: float, active: str, pos: float = None):
+        self._dur = max(float(dur), 0.0)
+        self._start = min(max(float(start), 0.0), self._dur)
+        self._end = min(max(float(end), 0.0), self._dur)
+        self._active = active if active in ('start', 'end') else 'start'
+        if pos is not None:
+            self._pos = min(max(float(pos), 0.0), self._dur)
+        self.redraw()
+
+    def set_position(self, t: float):
+        """更新当前播放位置（红色游标）"""
+        self._pos = min(max(float(t), 0.0), self._dur)
+        self.redraw()
+
+    # ---- 坐标换算 ----
+    def _track_w(self) -> int:
+        return max(1, self.winfo_width() - 2 * self.PAD)
+
+    def _x_of(self, t: float) -> int:
+        if self._dur <= 0:
+            return self.PAD
+        return self.PAD + int(round(t / self._dur * self._track_w()))
+
+    def _t_of(self, x: int) -> float:
+        if self._dur <= 0:
+            return 0.0
+        x = min(max(x - self.PAD, 0), self._track_w())
+        return x / self._track_w() * self._dur
+
+    # ---- 交互 ----
+    def _on_press(self, event):
+        if self._dur <= 0:
+            return
+        xs, xe = self._x_of(self._start), self._x_of(self._end)
+        pick = None
+        # 距哪个手柄更近（且在命中范围内）就选哪个；重叠时优先选中的那个
+        if abs(event.x - xs) <= self.HIT_PX or abs(event.x - xe) <= self.HIT_PX:
+            if self._active == 'end' and abs(event.x - xe) <= self.HIT_PX:
+                pick = 'end'
+            elif abs(event.x - xs) <= self.HIT_PX:
+                pick = 'start'
+            else:
+                pick = 'end'
+        if pick is None:
+            # 点到轨道空白区 -> 当作进度条定位（跳转播放位置）
+            if self._on_seek_cb:
+                self._on_seek_cb(self._t_of(event.x))
+            return
+        self._dragging = pick
+        if pick != self._active:
+            self._active = pick
+            if self._on_select_cb:
+                self._on_select_cb(pick)
+        self._apply(pick, self._t_of(event.x))
+
+    def _on_motion(self, event):
+        if not self._dragging:
+            return
+        self._apply(self._dragging, self._t_of(event.x))
+
+    def _on_release(self, _event):
+        self._dragging = None
+
+    def _apply(self, which: str, t: float):
+        # 保证开始<=结束（最小间隔 0.01s）
+        if which == 'start':
+            t = min(max(t, 0.0), max(self._end - 0.01, 0.0))
+        else:
+            t = min(max(t, self._start + 0.01), self._dur)
+        if self._on_drag_cb:
+            self._on_drag_cb(which, t)   # 由面板写回时间框并 seek 播放器
+
+    # ---- 绘制 ----
+    def redraw(self):
+        self.delete('all')
+        w = max(self.winfo_width(), 1)
+        h = int(self.winfo_height() or 30)
+        mid = h // 2
+        if self._dur <= 0:
+            self.create_rectangle(self.PAD, mid - 3, max(w - self.PAD, self.PAD + 1),
+                                  mid + 3, fill='#d9d9d9', outline='')
+            return
+        x0, x1 = self.PAD, w - self.PAD
+        xs, xe = self._x_of(self._start), self._x_of(self._end)
+        # 轨道
+        self.create_rectangle(x0, mid - 3, x1, mid + 3, fill='#c8c8c8', outline='')
+        # 已选范围高亮
+        if xe > xs:
+            self.create_rectangle(xs, mid - 3, xe, mid + 3, fill='#7fb2ff', outline='')
+        # 当前播放位置游标（红色竖线 + 顶部小三角），置于手柄之下
+        if self._dur > 0:
+            xp = self._x_of(self._pos)
+            self.create_line(xp, mid - 13, xp, mid + 13, fill='#e53935', width=2)
+            self.create_polygon(xp, mid - 15, xp - 4, mid - 21, xp + 4, mid - 21,
+                                fill='#e53935', outline='')
+        # 滑块手柄（选中者高亮）
+        for which, x in (('start', xs), ('end', xe)):
+            sel = (which == self._active)
+            hw = self.HANDLE_W + (2 if sel else 0)
+            self.create_polygon(x, mid - 11, x - hw, mid - 11, x - hw, mid + 1,
+                                x, mid + 11, x + hw, mid + 1, x + hw, mid - 11,
+                                fill='#0a66d0' if sel else '#8a8a8a',
+                                outline='#063f85' if sel else '#5a5a5a')
+            # 上方小刻度线，便于对齐时间
+            self.create_line(x, mid - 14, x, mid + 14,
+                             fill='#063f85' if sel else '#9a9a9a')
+
+
 class EmbeddedPlayer:
     """基于 OpenCV 的内嵌简易播放器（Canvas 渲染帧）"""
 
@@ -1617,6 +1762,7 @@ class VideoTranscodePanel:
         self.items: Dict[str, VideoListItem] = {}      # tree iid -> 条目
         self._paths: Set[str] = set()                  # 已加入路径（去重）
         self._current_iid: Optional[str] = None        # 当前选中的列表项
+        self._loading_item = False                     # 正在切换视频（挂起 trace 写回，防止串台）
         self.task_queue: List[TranscodeTask] = []      # 任务队列
         self.is_running = False
         self.stop_requested = False
@@ -1647,6 +1793,12 @@ class VideoTranscodePanel:
         if not enable_explorer_dragdrop(self.tree, self._add_paths):
             self._log("提示: 未检测到 tkinterdnd2，鼠标拖放不可用。"
                       "可执行 pip install tkinterdnd2 启用拖放，或使用“添加文件”按钮。", "warning")
+
+        # 键盘快捷键：视频列表选中视频后，空格=播放/暂停，左右方向键=±1 秒定位。
+        # 注意：ttk.Frame 不在子控件的 bindtag 中，绑在 self.frame 上收不到按键，
+        # 必须绑定到顶层窗口；Treeview 自身的按键单独绑定并返回 'break'，
+        # 以拦截其默认行为（空格重选条目导致重新载入、左右键折叠展开），见 _create_list_area。
+        self.frame.winfo_toplevel().bind('<KeyPress>', self._on_panel_key, add='+')
 
     # ------------------------------------------------------------------
     # UI 构建
@@ -1683,14 +1835,22 @@ class VideoTranscodePanel:
         cols = ("name", "size", "ext", "res", "bitrate", "start", "end")
         headers = ("文件名", "大小", "扩展名", "分辨率", "数据速率", "开始时间", "结束时间")
         widths = (240, 80, 60, 95, 95, 105, 105)
+        self._col_headers = dict(zip(cols, headers))
+        self._sort_col = None
+        self._sort_reverse = False
         self.tree = ttk.Treeview(lf, columns=cols, show="headings",
                                  selectmode="extended", height=8)
         for c, h, w in zip(cols, headers, widths):
-            self.tree.heading(c, text=h)
+            self.tree.heading(c, text=h, command=lambda col=c: self._sort_by(col))
             self.tree.column(c, width=w, anchor=tk.W if c == "name" else tk.CENTER)
         vsb = ttk.Scrollbar(lf, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
+        # 列表上的快捷键：空格=播放/暂停，左右方向键=±1 秒（返回 'break' 拦截
+        # Treeview 类默认绑定，避免空格重新选中条目、左右键折叠展开）
+        for _seq in ('<space>', '<KP_Space>', '<Left>', '<KP_Left>',
+                     '<Right>', '<KP_Right>'):
+            self.tree.bind(_seq, self._on_tree_key)
 
         # 按钮行放在列表下方（必须先于列表 pack 到 BOTTOM，否则会被 expand 的列表挤掉）
         btns = ttk.Frame(lf)
@@ -1699,7 +1859,8 @@ class VideoTranscodePanel:
         ttk.Button(btns, text="添加文件夹", command=self._browse_folder, width=10).pack(side=tk.LEFT, padx=2)
         ttk.Button(btns, text="移除选中", command=self._remove_selected, width=10).pack(side=tk.LEFT, padx=2)
         ttk.Button(btns, text="清空列表", command=self._clear_list, width=10).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btns, text="➕ 加入队列(选中)", command=self._join_queue, width=16).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btns, text="➕ 加入选中", command=lambda: self._join_queue(only_selected=True), width=10).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btns, text="➕ 加入所有", command=lambda: self._join_queue(only_selected=False), width=10).pack(side=tk.LEFT, padx=2)
 
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
@@ -1712,19 +1873,13 @@ class VideoTranscodePanel:
         self.player = EmbeddedPlayer(lf, on_time=self._on_player_time,
                                      on_state=self._on_player_state)
 
-        # 播放进度滚动条（可鼠标拖动定位）
-        seek_frame = ttk.Frame(lf)
-        seek_frame.pack(fill=tk.X, pady=(4, 0))
-        ttk.Label(seek_frame, text="进度").pack(side=tk.LEFT, padx=(0, 4))
-        self.seek_var = tk.DoubleVar(value=0.0)
-        self._seek_dragging = False
-        self._seek_was_playing = False
-        self.seek_scale = tk.Scale(seek_frame, from_=0.0, to=100.0, orient=tk.HORIZONTAL,
-                                   showvalue=False, variable=self.seek_var,
-                                   resolution=0.01, command=self._on_seek_move)
-        self.seek_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.seek_scale.bind('<ButtonPress-1>', self._on_seek_press)
-        self.seek_scale.bind('<ButtonRelease-1>', self._on_seek_release)
+        # 剪辑范围双滑块条（同时充当进度条）：前滑块=开始时间，后滑块=结束时间
+        # 拖动滑块即选中并让画面跟随；点按/拖拽轨道空白区即定位播放位置（红色游标）
+        self.trim_bar = TrimRangeBar(lf,
+                                     on_select=self._on_trim_slider_select,
+                                     on_drag=self._on_trim_slider_drag,
+                                     on_seek=self._on_track_seek)
+        self.trim_bar.pack(fill=tk.X, pady=(4, 0))
 
         # 播放控制行
         ctrl = ttk.Frame(lf)
@@ -1747,10 +1902,11 @@ class VideoTranscodePanel:
         ttk.Label(ctrl, textvariable=self.time_var,
                   font=('Consolas', 10, 'bold')).pack(side=tk.RIGHT, padx=5)
 
-        # 时间剪辑行（“-/+”紧贴时间框右侧，“设为当前”靠右对齐）
+        # 时间剪辑行（“-/+”紧贴时间框右侧，“设为当前”紧随其后；
+        # 最右列为“移到最前 / 移到最后”，用于把前/后两个滑块一键移到片头 / 片尾）
         trim = ttk.Frame(lf)
         trim.pack(fill=tk.X, pady=(6, 0))
-        trim.columnconfigure(4, weight=1)   # 间隔列，仅用于把“设为当前”推到最右
+        trim.columnconfigure(5, weight=1)   # 间隔列，仅用于把“移到最前 / 最后”推到最右
 
         self.start_var = tk.StringVar(value="00:00:00.00")
         self.end_var = tk.StringVar(value="00:00:00.00")
@@ -1762,8 +1918,9 @@ class VideoTranscodePanel:
         self.end_var.trace_add('write', self._on_trim_edit)
 
         # 开始时间（掩码输入框，回车按新时间定位/播放）
-        self._active_time_field = 'start'   # 最近编辑的时间框：'start' / 'end'
-        ttk.Label(trim, text="开始时间:").grid(row=0, column=0, sticky=tk.W, padx=(0, 4))
+        self._active_time_field = 'start'   # 当前激活的时间框/滑块：'start' / 'end'（默认=前滑块）
+        self.start_lbl = ttk.Label(trim, text="开始时间:")
+        self.start_lbl.grid(row=0, column=0, sticky=tk.W, padx=(0, 4))
         self.start_entry = TimeEntry(trim, textvariable=self.start_var,
                                      on_return=lambda: self._on_time_return('start'))
         self.start_entry.grid(row=0, column=1, sticky=tk.W)
@@ -1773,10 +1930,14 @@ class VideoTranscodePanel:
         ttk.Button(trim, text="+", width=3,
                    command=lambda: self._adjust_time('start', 1)).grid(row=0, column=3, padx=(1, 2))
         ttk.Button(trim, text="◀ 设为当前", width=11,
-                   command=lambda: self._set_time_from_player('start')).grid(row=0, column=5, padx=(8, 0))
+                   command=lambda: self._set_time_from_player('start')).grid(row=0, column=4, padx=(6, 0))
+        ttk.Button(trim, text="⏮ 移到最前", width=11,
+                   command=lambda: self._move_slider('start', 'first')).grid(
+                   row=0, column=6, sticky=tk.E, padx=(8, 0))
 
         # 结束时间
-        ttk.Label(trim, text="结束时间:").grid(row=1, column=0, sticky=tk.W, padx=(0, 4), pady=(4, 0))
+        self.end_lbl = ttk.Label(trim, text="结束时间:")
+        self.end_lbl.grid(row=1, column=0, sticky=tk.W, padx=(0, 4), pady=(4, 0))
         self.end_entry = TimeEntry(trim, textvariable=self.end_var,
                                    on_return=lambda: self._on_time_return('end'))
         self.end_entry.grid(row=1, column=1, sticky=tk.W, pady=(4, 0))
@@ -1786,9 +1947,14 @@ class VideoTranscodePanel:
         ttk.Button(trim, text="+", width=3,
                    command=lambda: self._adjust_time('end', 1)).grid(row=1, column=3, padx=(1, 2), pady=(4, 0))
         ttk.Button(trim, text="▶ 设为当前", width=11,
-                   command=lambda: self._set_time_from_player('end')).grid(row=1, column=5, padx=(8, 0), pady=(4, 0))
+                   command=lambda: self._set_time_from_player('end')).grid(
+                   row=1, column=4, padx=(6, 0), pady=(4, 0))
+        ttk.Button(trim, text="⏭ 移到最后", width=11,
+                   command=lambda: self._move_slider('end', 'last')).grid(
+                   row=1, column=6, sticky=tk.E, padx=(8, 0), pady=(4, 0))
 
         # 精度 + 操作
+        self._mark_active_time('start')   # 默认激活前滑块（开始时间），界面高亮同步
         row2 = ttk.Frame(trim)
         row2.grid(row=2, column=0, columnspan=5, sticky=tk.EW, pady=(8, 0))
         ttk.Label(row2, text="精度:").pack(side=tk.LEFT, padx=(0, 4))
@@ -1844,12 +2010,15 @@ class VideoTranscodePanel:
         orient_cb.grid(row=4, column=1, sticky=tk.W, padx=4, pady=(6, 0))
         orient_cb.bind("<<ComboboxSelected>>", lambda e: self._apply_orientation())
 
-        # 视频码率
+        # 视频码率（只作用于视频流 -b:v，音频固定 -b:a 128k）
         ttk.Label(lf, text="视频码率(kbps):").grid(row=5, column=0, sticky=tk.W, pady=(6, 0))
         self.bitrate_var = tk.IntVar(value=2500)
-        ttk.Spinbox(lf, from_=100, to=50000, increment=100,
-                    textvariable=self.bitrate_var, width=12).grid(
-            row=5, column=1, sticky=tk.W, padx=4, pady=(6, 0))
+        bitrate_spin = ttk.Spinbox(lf, from_=100, to=50000, increment=100,
+                                   textvariable=self.bitrate_var, width=12)
+        bitrate_spin.grid(row=5, column=1, sticky=tk.W, padx=4, pady=(6, 0))
+        self._add_tooltip(bitrate_spin,
+                          "仅设置“视频流”码率（ffmpeg -b:v），音频固定 -b:a 128k，\n"
+                          "与列表“数据速率”列口径一致：均不含音频")
 
         # 并发数
         ttk.Label(lf, text="同时处理数:").grid(row=6, column=0, sticky=tk.W, pady=(6, 0))
@@ -2201,6 +2370,36 @@ class VideoTranscodePanel:
             except Exception:
                 return
 
+    def _probe_stream_bitrate_kbps(self, path: str) -> float:
+        """用 ffprobe 读取视频流码率（kbps）。
+
+        只统计视频流，与资源管理器“数据速率 / Data rate”口径一致（不含音频；
+        音频在转码时固定 -b:a 128k）。返回 0 表示读取失败，调用方回退估算值。
+        """
+        ffprobe = self._get_ffprobe()   # 复用已有实现（ffmpeg 同目录 -> PATH，带缓存）
+        if not ffprobe:
+            return 0.0
+        try:
+            flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+            # 注意：-select_streams 不支持 "v+a" 这种写法（会报 Invalid stream specifier），
+            # 故一次性取出所有流的类型与码率，只累加 video / audio（排除字幕、封面等）
+            res = subprocess.run(
+                [ffprobe, '-v', 'error', '-show_entries', 'stream=codec_type,bit_rate',
+                 '-of', 'csv=p=0', path],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                timeout=20, creationflags=flags)
+            total = 0
+            for line in res.stdout.decode('utf-8', 'replace').splitlines():
+                # 每行形如 "video,1797735" / "audio,128971"，码率可能为 N/A
+                parts = [x.strip() for x in line.split(',')]
+                # 只取视频流，与资源管理器“数据速率”一致（音频不计入）
+                if len(parts) >= 2 and parts[0] == 'video':
+                    if parts[-1].isdigit():
+                        total += int(parts[-1])
+            return total / 1000.0 if total > 0 else 0.0
+        except Exception:
+            return 0.0
+
     def _probe_video(self, path: str) -> VideoListItem:
         p = Path(path)
         item = VideoListItem(path=str(p), ext=p.suffix[1:].upper())
@@ -2223,7 +2422,12 @@ class VideoTranscodePanel:
             except Exception:
                 pass
         if item.duration > 0 and item.size > 0:
+            # 估算值：整个文件（含容器头/索引等开销）÷ 时长，通常比真实码率偏高
             item.bitrate_kbps = item.size * 8 / 1000 / item.duration
+        # 优先采用 ffprobe 读到的真实流码率（视频+音频），读不到时保留上面的估算值
+        real_bitrate = self._probe_stream_bitrate_kbps(str(p))
+        if real_bitrate > 0:
+            item.bitrate_kbps = real_bitrate
         item.end = item.duration  # 默认从头到尾
         return item
 
@@ -2246,6 +2450,43 @@ class VideoTranscodePanel:
             res, bitrate, format_clock(item.start), format_clock(item.end)))
         self.items[iid] = item
         self._log(f"已添加: {Path(item.path).name} ({res}, {self._format_size(item.size)})", "info")
+
+    def _sort_by(self, col: str):
+        """点击表头按该列排序：首次点击为升序，再次点击同一列切换为降序，表头显示 ▲/▼ 指示"""
+        # 同列再次点击则翻转方向；切换到其它列时从升序开始
+        new_reverse = (not self._sort_reverse) if self._sort_col == col else False
+        self._sort_col = col
+        self._sort_reverse = new_reverse
+        pairs = list(self.items.items())
+
+        def key(kv):
+            it = kv[1]
+            if col == "size":
+                return it.size or 0
+            if col == "bitrate":
+                return it.bitrate_kbps or 0
+            if col == "start":
+                return it.start
+            if col == "end":
+                return it.end
+            if col == "res":
+                return (it.width or 0, it.height or 0)
+            if col == "name":
+                return Path(it.path).name.lower()
+            if col == "ext":
+                return (it.ext or "").lower()
+            return 0
+
+        pairs.sort(key=key, reverse=new_reverse)
+        for idx, (iid, _it) in enumerate(pairs):
+            self.tree.move(iid, "", idx)
+        self._update_sort_indicator(col, new_reverse)
+
+    def _update_sort_indicator(self, col: str, reverse: bool):
+        """刷新各列表头文本，在激活列上标注排序箭头"""
+        arrow = " ▼" if reverse else " ▲"
+        for c, h in self._col_headers.items():
+            self.tree.heading(c, text=(h + arrow) if c == col else h)
 
     def _remove_selected(self):
         for iid in self.tree.selection():
@@ -2277,64 +2518,98 @@ class VideoTranscodePanel:
         if not self.player.load(item.path):
             self._log(f"无法打开视频: {Path(item.path).name}", "error")
             return
-        self.start_var.set(format_clock(item.start))
-        self.end_var.set(format_clock(item.end))
-        self._sync_seek_range()
-        self._on_player_time(0.0)
+        # 切换视频时，恢复该视频“已保存”的剪辑时间（而非强制复位为默认）。
+        # 用 _loading_item 挂起 _on_trim_edit 的 trace 写回：否则先 set 的 start_var
+        # 会带着上一个视频残留的 end_var 值串写进当前条目（结束滑块“自动提前”的根源）。
+        self._loading_item = True
+        try:
+            self.start_var.set(format_clock(item.start))
+            self.end_var.set(format_clock(item.end))
+        finally:
+            self._loading_item = False
+        self._refresh_trim_columns()
+        self._update_trim_bar()
+        # 播放器跳转到该视频已设置的开始时间，并以保存的开始/结束时间作为当前片段范围
+        t0 = item.start
+        if self.player.cap is not None:
+            self.player.seek(t0)
+        self._on_player_time(t0)
+
+    def _refresh_trim_columns(self, iid: Optional[str] = None):
+        """把条目的开始/结束时间刷新到列表对应列，保持界面与数据一致"""
+        iid = iid or self._current_iid
+        if not iid or iid not in self.items:
+            return
+        item = self.items[iid]
+        self.tree.set(iid, "start", format_clock(item.start))
+        self.tree.set(iid, "end", format_clock(item.end))
 
     def _sync_seek_range(self):
-        """根据当前视频时长同步进度条量程"""
+        """根据当前视频时长同步剪辑范围条量程与播放位置游标"""
         dur = max(self.player.duration, 0.01)
-        self.seek_scale.configure(to=dur)
-        self.seek_var.set(0.0)
+        self.trim_bar.set_position(0.0)
+        self._update_trim_bar()
 
     def _on_player_time(self, t: float):
         self.time_var.set(f"{format_clock(t)} / {format_clock(self.player.duration)}")
-        if not self._seek_dragging:
-            try:
-                self.seek_var.set(min(t, float(self.seek_scale.cget('to'))))
-            except Exception:
-                pass
+        self.trim_bar.set_position(t)
 
     def _on_player_state(self, playing: bool):
         self.play_btn.config(text="⏸ 暂停" if playing else "▶ 播放")
 
-    # ---- 进度条拖动 ----
-    def _on_seek_press(self, _event=None):
-        self._seek_dragging = True
-        self._seek_was_playing = self.player.playing
-        self.player.pause()
-
-    def _on_seek_move(self, value):
-        """拖动/键盘调整进度条时跳到对应时间，并同步到当前激活的时间框"""
+    # ---- 轨道点击/拖拽定位（替代原进度条） ----
+    def _on_track_seek(self, t: float):
+        """点按/拖拽双滑块条轨道空白区：定位播放位置（不改动开始/结束时间）"""
         if self.player.cap is None:
             return
-        try:
-            t = float(value)
-        except (TypeError, ValueError):
-            return
-        if self._seek_dragging:
-            self.player.seek(t)
-            self._sync_active_time(t)
-        elif self.player.playing:
-            self.player.play(from_time=t)
-        else:
-            self.player.seek(t)
-
-    def _on_seek_release(self, _event=None):
-        if not self._seek_dragging:
-            return
-        self._seek_dragging = False
-        # 以播放器实际位置为准（拖动过程中 _on_seek_move 已同步 seek 到该位置）
-        t = self.player.current_time
-        self._sync_active_time(t)
-        if self._seek_was_playing:
+        if self.player.playing:
             self.player.play(from_time=t)
         else:
             self.player.seek(t)
 
     def _toggle_play(self):
         self.player.toggle()
+
+    def _on_tree_key(self, event):
+        """视频列表上的按键：转交面板快捷键处理，并拦截 Treeview 默认行为"""
+        return self._on_panel_key(event)
+
+    def _on_panel_key(self, event):
+        """键盘快捷键（面板级，输入框聚焦时不拦截以免影响输入）：
+        - 空格：播放/暂停当前选中视频
+        - 左/右方向键：视频定位前/后 1 秒
+        """
+        w = event.widget
+        # 焦点在输入框/下拉/按钮/文本域时不接管按键，避免干扰正常输入与按钮触发
+        if isinstance(w, (tk.Entry, ttk.Entry, ttk.Combobox, ttk.Spinbox,
+                         ttk.Button, tk.Button, tk.Text)):
+            return
+        if self.player.cap is None:
+            return
+        sym = event.keysym
+        if sym == 'space':
+            self.player.toggle()
+            return 'break'
+        if sym == 'Left':
+            self._scrub(-1.0)
+            return 'break'
+        if sym == 'Right':
+            self._scrub(1.0)
+            return 'break'
+
+    def _scrub(self, delta: float):
+        """以当前播放位置为基准前后定位 delta 秒（默认 1 秒），并同步到激活时间框"""
+        if self.player.cap is None:
+            return
+        t = self.player.current_time + delta
+        t = max(0.0, t)
+        if self.player.duration > 0:
+            t = min(t, self.player.duration)
+        if self.player.playing:
+            self.player.play(from_time=t)
+        else:
+            self.player.seek(t)
+        self._sync_active_time(t)
 
     def _toggle_blank(self):
         """隐藏/显示播放器画面（黑屏），不影响播放状态与时间"""
@@ -2361,13 +2636,44 @@ class VideoTranscodePanel:
         self.player.seek(target)
 
     def _mark_active_time(self, which: str):
-        """记录最近编辑的时间框（'start' / 'end'）"""
+        """记录当前激活的时间框/滑块（'start' / 'end'），并同步高亮显示"""
         self._active_time_field = which
+        try:
+            self.start_lbl.config(foreground='#0a66d0' if which == 'start' else '#333333')
+            self.end_lbl.config(foreground='#0a66d0' if which == 'end' else '#333333')
+        except Exception:
+            pass
+        if hasattr(self, 'trim_bar'):
+            self.trim_bar.set_active(which)
 
     def _sync_active_time(self, t: float):
         """把播放器位置同步写入当前激活的时间框"""
         which = getattr(self, '_active_time_field', 'start')
         (self.start_var if which == 'start' else self.end_var).set(format_clock(t))
+
+    # ---- 剪辑范围双滑块 ----
+    def _on_trim_slider_select(self, which: str):
+        """点击滑块：把它设为当前激活滑块，之后 ±/方向键/设为当前 都作用于它"""
+        self._mark_active_time(which)
+
+    def _on_trim_slider_drag(self, which: str, t: float):
+        """拖动滑块：写回对应时间框（自动同步列表条目），播放器画面跟随该滑块"""
+        (self.start_var if which == 'start' else self.end_var).set(format_clock(t))
+        if self.player.cap is not None:
+            self.player.seek(t)
+        self._update_trim_bar()
+
+    def _update_trim_bar(self):
+        """把当前时间框/视频时长/激活滑块同步到剪辑范围条"""
+        if not hasattr(self, 'trim_bar'):
+            return
+        dur = max(self.player.duration, 0.01)
+        s = parse_clock(self.start_var.get())
+        e = parse_clock(self.end_var.get())
+        self.trim_bar.set_values(dur,
+                                 0.0 if s is None else s,
+                                 dur if e is None else e,
+                                 getattr(self, '_active_time_field', 'start'))
 
     def _on_time_return(self, which: str):
         """时间框回车：播放中则从新时间继续播放；否则仅定位并显示该帧（保持暂停）"""
@@ -2407,6 +2713,25 @@ class VideoTranscodePanel:
         t = self.player.current_time
         (self.start_var if which == 'start' else self.end_var).set(format_clock(t))
 
+    def _move_slider(self, which: str, position: str):
+        """把剪辑范围的滑块快速移到片头 / 片尾。
+
+        which: 'start'（前滑块=开始时间）/ 'end'（后滑块=结束时间）
+        position: 'first'（最开始时间，即 00:00:00）/ 'last'（最后时间，即视频时长）
+        """
+        if self.player.cap is None:
+            return
+        self._mark_active_time(which)
+        dur = self.player.duration
+        t = 0.0 if position == 'first' else (dur if dur > 0 else 0.0)
+        (self.start_var if which == 'start' else self.end_var).set(format_clock(t))
+        # 播放器画面跟随该滑块移动到目标时间（播放中则从该时间继续播放）
+        if self.player.playing:
+            self.player.play(from_time=t)
+        else:
+            self.player.seek(t)
+        self._update_trim_bar()
+
     def _preview_clip(self):
         """点击“播放片段”：立即跳到开始时间播放，到结束时间停止"""
         if self.player.cap is None:
@@ -2424,7 +2749,6 @@ class VideoTranscodePanel:
         if e <= s:
             messagebox.showwarning("提示", "请先设置有效的开始/结束时间（结束需大于开始）")
             return
-        self._seek_dragging = False
         self.player.play(from_time=s, stop_at=e)
 
     def _on_trim_edit(self, *_args):
@@ -2433,6 +2757,8 @@ class VideoTranscodePanel:
         这样“加入队列 / 开始转码”会直接采用屏幕上显示的时间，无需再点“✔ 保存到选中视频”。
         仅在时间合法（结束>开始、未超片长）时提交，避免输入过程中的中间值污染条目。
         """
+        if self._loading_item:
+            return
         if not self._current_iid or self._current_iid not in self.items:
             return
         item = self.items[self._current_iid]
@@ -2444,6 +2770,8 @@ class VideoTranscodePanel:
             return
         item.start = s
         item.end = min(e, item.duration) if item.duration > 0 else e
+        self._refresh_trim_columns()
+        self._update_trim_bar()
 
     def _apply_trim(self):
         """确认后保存到视频列表中"""
@@ -2486,7 +2814,7 @@ class VideoTranscodePanel:
         idx = cls._frame_index_of(t, fps)
         return t if idx is None else idx / fps
 
-    def _join_queue(self):
+    def _join_queue(self, only_selected: bool = False):
         if not self.items:
             messagebox.showwarning("提示", "视频列表为空，请先添加视频")
             return
@@ -2496,16 +2824,20 @@ class VideoTranscodePanel:
             return
         added = 0
         sub_mode = self._subtitle_mode()
-        # 多选支持：若列表里用 Ctrl/Shift 选中了若干项，则只把选中项加入队列；
-        # 未选中任何项时退回“把列表全部视频加入队列”的旧行为。
-        sel_set = set(self.tree.selection())
-        if sel_set:
+        # “加入选中”：仅把列表中 Ctrl/Shift 多选的项加入队列（按列表显示顺序）；
+        # 未选中任何项时提示。“加入所有”：把列表全部视频加入队列。
+        if only_selected:
+            sel_set = set(self.tree.selection())
             targets = [self.items[i] for i in self.tree.get_children()
                        if i in sel_set and i in self.items]
+            if not targets:
+                messagebox.showinfo("提示", "请先在视频列表中选中要加入队列的视频\n"
+                                            "（Ctrl+点击 多选，Shift+点击 连选）")
+                return
             self._log(f"已选中 {len(targets)} 个视频，仅将选中项加入队列", "highlight")
         else:
             targets = list(self.items.values())
-            self._log("未选中具体视频，将列表全部视频加入队列", "highlight")
+            self._log(f"将列表全部 {len(targets)} 个视频加入队列", "highlight")
         for item in targets:
             # 起点对齐到源视频帧格，保证“预览画面 = 转码首帧”
             s = self._snap_to_frame(item.start, item.fps)
@@ -2859,7 +3191,8 @@ class VideoTranscodePanel:
         gpu=True 时生成 CUDA 滤镜链（scale_cuda / pad_cuda），在显存内完成处理。
         """
         res = task.resolution
-        if res in ("保持原分辨率", "") and task.src_w > 0:
+        keep_original = (res in ("保持原分辨率", ""))
+        if keep_original and task.src_w > 0:
             tw, th = task.src_w, task.src_h
         else:
             try:
@@ -2883,7 +3216,14 @@ class VideoTranscodePanel:
             except (ValueError, ZeroDivisionError):
                 pass
 
-        if task.src_w > 0 and (tw, th) == (task.src_w, task.src_h):
+        # 只有“保持原分辨率”（且无需比例校正）才可以省略滤镜。
+        # 一旦用户显式指定了目标分辨率，就必须始终加 scale/pad：
+        # 探测到的 src_w/src_h 只是源视频“开头”的尺寸，部分视频中途会改变分辨率
+        # （如开头 1280x720、后面 856x480），此时若因“目标尺寸==探测尺寸”而跳过滤镜，
+        # 裁剪后的片段会按它自身的尺寸原样输出，导致成片分辨率与设置不符。
+        if (keep_original and task.src_w > 0
+                and (tw, th) == (task.src_w, task.src_h)
+                and (not aspect or aspect == "保持原比例")):
             return None
         if gpu:
             # 显存内缩放 + 黑边填充：全程不回系统内存（不可再加 hwdownload，本机会报

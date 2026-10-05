@@ -43,8 +43,18 @@ file_mover/
 ├── file_organize_tab.py    # Tab: 文件名整理
 ├── video_grid_tab.py       # Tab: 视频缩略图
 ├── video_check_tab.py      # Tab: 视频文件检查
+├── subtitle_tab.py         # Tab: 视频语音识别并翻译为字幕（也可独立运行）
 ├── log_tab.py              # Tab: 操作日志
 ├── new_feature_tab.py      # 示例：如何添加新选项卡的模板
+│
+├── toast.py                # 公共组件：右下角浮出式提醒（Toast，全程序复用）
+├── subtitle/               # 字幕生成模块（由「视频语音识别并翻译为字幕」项目移植）
+│   ├── config.py           #   常量、模型清单、配置读写（subtitle/subtitle_config.json）
+│   ├── system_utils.py     #   FFmpeg / CUDA / 模型路径解析与校验
+│   ├── core.py             #   TaskItem / SubtitleGenerator / WorkerThread
+│   ├── dialogs.py          #   设置对话框 / 依赖检查对话框
+│   ├── panel.py            #   SubtitlePanel 面板（可嵌入 Notebook 或独立窗口）
+│   └── ui_utils.py         #   DPI 缩放 / 字体 / 窗口居中
 │
 ├── app_config.json         # 应用配置文件（运行时生成）
 └── AGENTS.md               # 本文件
@@ -136,6 +146,25 @@ def _append_log(self, message):
     self.frame.after(0, self._update_ui, message)
 ```
 
+### 6. 字幕生成模块（subtitle_tab.py + subtitle/）
+
+把「20260722-视频语音识别并翻译为字幕」项目（v3.4.0）的功能整体移植为一个选项卡：
+
+- `SubtitleTab`：选项卡外壳，`main.py` 中注册为「视频转字幕(subtitle_tab)」；
+  `python subtitle_tab.py` 可独立启动完整窗口（内部使用 `SubtitlePanel`）。
+- `SubtitlePanel`：真正的界面面板（`ttk.Frame`），既可放进 Notebook，也可放进独立 `Tk` 窗口。
+- 处理链路：视频 → ffmpeg 抽 16kHz 音频 → 语音识别（faster-whisper / kotoba-whisper / ReazonSpeech-NeMo）
+  → 翻译（NLLB-200 / Sakura-7B / Sakura-14B / Sakura-GalTransl-7B）→ 生成 SRT（可选双语）。
+- **模型文件不随程序拷贝**：只保存路径，默认指向 `subtitle/subtitle_config.json` 中的
+  `model_root`（原字幕工具项目的模型目录），可在【设置】中修改，也可对每个模型单独指定。
+  配置独立于主程序，读写 `subtitle/subtitle_config.json`，不写入 `app_config.json`。
+- GPU/CPU：界面单选；CUDA 不可用自动切 CPU；单个视频在 GPU 上失败（CUDA/显存/不支持的格式）
+  会自动改用 CPU 重试一次（关键字见 `config.GPU_ERROR_KEYWORDS`）。
+- 任务完成后动作：`none` / `sleep` / `shutdown`（在【完成后】下拉框选择，设置对话框同样可改）。
+- **不使用 messagebox 报告任务状态**：统一调用 `toast.show_toast(self.frame, ...)` 在右下角浮出提示。
+- 任务列表支持拖放（文件夹可递归多级子目录，由“包含子文件夹”控制）、Ctrl/Shift 多选、
+  移除选中 / 只处理选中 / 一键清空。拖放依赖 `tkinterdnd2`，未安装时自动降级（仅按钮添加）。
+
 ## 开发规范
 
 ### 代码风格
@@ -190,6 +219,9 @@ python main.py
 # 独立运行某个 Tab（部分支持）
 python file_move_tab.py
 python file_organize_tab.py
+
+# 独立运行字幕生成工具（完整窗口，与主程序共用 subtitle/ 模块）
+python subtitle_tab.py
 ```
 
 ### 依赖安装

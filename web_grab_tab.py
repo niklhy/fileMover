@@ -478,9 +478,9 @@ LIST_PANEL_EDGE_BG = '#1e88e5'    # 层左侧的明显颜色边条（与主窗�
 # 缓存文件夹容量超过 LIST_CACHE_MAX_BYTES 后自动清掉最旧的文件
 LIST_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               'cache', 'list_page')
-# 多页连续抓取时一个网址可能缓存上百张缩略图 + 多页解析结果，
-# 容量给得宽一些，避免刚抓过的页被清掉、下次打开又要重新联网
-LIST_CACHE_MAX_BYTES = 200 * 1024 * 1024   # 200MB
+# 缓存文件夹容量上限的“兜底默认值”（50MB）。实际生效值由“本地设置 → 列表缓存上限(MB)”
+# 动态控制（存于 self._list_cache_max_bytes），此处仅在配置缺失/异常时回退使用。
+LIST_CACHE_MAX_BYTES = 50 * 1024 * 1024   # 50MB（兜底默认）
 
 # 多页连续抓取时的缩略图节流：上一页还有超过 LIST_BATCH_THUMB_PENDING 张图没下载完，
 # 就先等一等再抓下一页（最多等 LIST_BATCH_THUMB_WAIT_SEC 秒），
@@ -3179,6 +3179,9 @@ class WebGrabTab:
         self._list_pagination: Dict[str, Any] = {}   # 当前页分页信息（当前页/总页数/页码区间）
         self._list_thumb_canvas = None     # “显示/隐藏缩略图”图标按钮
         self._list_view_canvas = None      # “瀑布流/列表”切换图标按钮
+        # 列表页磁盘缓存容量上限（字节）：由“本地设置”中的“列表缓存上限(MB)”动态控制，
+        # 默认 50MB；可在本地设置里修改，修改后立即按新值清理超容文件
+        self._list_cache_max_bytes = 50 * 1024 * 1024
         self._list_rows: List[Dict] = []   # 列表模式的行控件（frame/title/item）
         self._list_selected_row = None     # 列表模式当前选中的行
         self._list_title_tip = None        # 缩略图悬浮标题提示层
@@ -3597,6 +3600,40 @@ class WebGrabTab:
         ttk.Button(btn_row, text="移除选中", width=10, command=remove_selected).pack(
             side=tk.LEFT, padx=2)
 
+        # ----- 列表页缓存：容量上限（MB） -----
+        cache_frame = ttk.LabelFrame(body, text="列表页缓存（cache\\list_page 容量上限）")
+        cache_frame.pack(fill=tk.X, pady=(8, 2))
+        cache_inner = ttk.Frame(cache_frame)
+        cache_inner.pack(fill=tk.X, padx=5, pady=4)
+        ttk.Label(cache_inner, text="缓存上限(MB):").pack(side=tk.LEFT)
+        cache_mb_var = tk.IntVar(
+            value=max(1, getattr(self, '_list_cache_max_bytes', 0) // (1024 * 1024)))
+
+        def on_cache_mb_change():
+            """把缓存上限(MB)写入配置并立即生效（按新值清理超容文件）"""
+            try:
+                mb = int(cache_mb_var.get())
+            except (TypeError, ValueError):
+                mb = 50
+            if mb < 1:
+                mb = 1
+            self._list_cache_max_bytes = mb * 1024 * 1024
+            self.config_manager.set(self.CONFIG_SECTION, 'list_cache_max_mb', mb)
+            self._log(f"列表页缓存上限已设为 {mb}MB")
+            try:
+                self._list_trim_cache()
+            except Exception:
+                pass
+
+        cache_sb = ttk.Spinbox(cache_inner, from_=1, to=2000, textvariable=cache_mb_var,
+                               width=6)
+        cache_sb.pack(side=tk.LEFT, padx=5)
+        cache_sb.config(command=on_cache_mb_change)          # 点击上下箭头
+        cache_sb.bind('<FocusOut>', lambda e: on_cache_mb_change())   # 手动输入后失焦
+        ttk.Label(cache_inner,
+                  text="修改后立即生效，按修改时间从旧到新清理超容缓存",
+                  foreground="#888888").pack(side=tk.LEFT, padx=6)
+
         # ----- 本地翻译大模型：为每个模型指定所在文件夹 -----
         model_frame = ttk.LabelFrame(body, text="本地翻译大模型（为各模型指定所在文件夹）")
         model_frame.pack(fill=tk.X, pady=(8, 2))
@@ -3917,6 +3954,30 @@ class WebGrabTab:
         except Exception as e:
             self._log(f"保存视频检索索引失败（本次仍按扫描结果检索）：{e}")
 
+    def _actor_names_from_parent(self, folder_path: str) -> List[Dict[str, str]]:
+        """从文件路径逐级向上查找“演员文件夹”，返回其演员名列表（未找到返回 []）
+
+        例：Y:\\个人专属\\s三佳詩\\ABF-292... → 在父目录 s三佳詩 命中演员文件夹，
+        返回 [{'japanese_name': '三佳詩', 'chinese_name': ''}]。遇到已设置的根目录即停止。
+        """
+        roots = {self._format_display_path(p)
+                 for p in (getattr(self, 'local_folders', None) or [])}
+        parent = os.path.dirname(folder_path.rstrip('\\/'))
+        seen = set()
+        while parent and parent not in seen:
+            seen.add(parent)
+            if parent in roots:          # 已抵达根目录，不再向上
+                break
+            name = os.path.basename(parent.rstrip('\\/'))
+            parsed = self._parse_actor_folder_name(name)
+            if parsed and parsed.get('actor_names'):
+                return list(parsed['actor_names'])
+            new_parent = os.path.dirname(parent)
+            if new_parent == parent:     # 已到驱动器根（如 Y:\\），防止死循环
+                break
+            parent = new_parent
+        return []
+
     def _add_folder_to_video_index(self, folder_path: str,
                                    info: Optional[Dict[str, Any]] = None):
         """把刚创建的视频文件夹（完整路径 + 视频信息）写入本地检索索引缓存
@@ -3959,6 +4020,13 @@ class WebGrabTab:
         code = str((info or {}).get('code') or '').strip()
         if code:
             record['video_code'] = self._norm_code_value(code)
+
+        # 若本文件夹位于某个“演员文件夹”之内（如 s三佳詩\ABF-292...），
+        # 把该父级演员名挂到本记录上，使按演员检索也能直接命中这个视频文件夹，
+        # 而不只是命中其父演员文件夹
+        actor_names = self._actor_names_from_parent(folder_path)
+        if actor_names:
+            record['actor_names'] = actor_names
         records.append(record)
 
         data['count'] = len(records)
@@ -3994,6 +4062,7 @@ class WebGrabTab:
             scanned_roots.append(folder)      # 保持与配置一致的原始路径（缓存命中比对用）
             try:
                 for current, dirs, _files in os.walk(folder, onerror=lambda e: None):
+                    current = self._format_display_path(current)   # 统一为反斜杠，避免 Y:/.../名 混用
                     for name in list(dirs):
                         record = {
                             'file_path': os.path.join(current, name),  # 文件夹完整路径（对应视频表 media_files.file_path / files.relative_path）
@@ -4034,6 +4103,7 @@ class WebGrabTab:
             [声母或0][演员日文名]([演员中文名])[+[曾用日文名]([曾用中文名])]...
             例：f楓ふうあ(枫芙爱)
                 f鳳みゆ(凤美优)+川北メイサ(川北明沙)
+                s三佳詩            ← 主名可只写日文名、省略括号（常见写法）
                 hひなの花音(雏乃花音)+朝海汐   ← 曾用名允许只写日文名、不带括号
         """
         name = str(folder_name or '').strip()
@@ -4048,7 +4118,6 @@ class WebGrabTab:
         rest = head.group(2)
 
         actor_names: List[Dict[str, str]] = []
-        valid_pairs = 0
         for part in re.split(r'\s*\+\s*', rest):   # 以 + 分隔主名与曾用名
             pair = re.match(r'^\s*([^()（）]+?)\s*[（(]\s*([^()（）]*?)\s*[）)]\s*$', part)
             if pair:
@@ -4061,9 +4130,9 @@ class WebGrabTab:
                         'japanese_name': jp,   # 演员日文名（对应 actors.japanese_name）
                         'chinese_name': cn,    # 演员中文名（对应 actors.chinese_name）
                     })
-                    valid_pairs += 1
                 continue
-            # 曾用名可能只写日文名、不带括号（如「+朝海汐」）：非 ASCII 即视为演员名
+            # 主名或曾用名可只写日文名、不带括号（如「s三佳詩」「+朝海汐」）：
+            # 非 ASCII 即视为演员名（省略中文名，仍可参与匹配）
             bare = part.strip()
             if bare and not bare.isascii():
                 actor_names.append({
@@ -4071,9 +4140,13 @@ class WebGrabTab:
                     'chinese_name': '',
                 })
 
-        # 至少要有一段完整的「日文名(中文名)」才算演员文件夹：
-        # 既支持省略括号的曾用名，又不会把「s蓝光原盘」这类普通文件夹误判成演员文件夹
-        if not valid_pairs:
+        # 只要存在“非 ASCII 的日文名”即视为演员文件夹（覆盖 s三佳詩 这类省略括号的写法）；
+        # 通过“日文名含非 ASCII”排除 sABF-202 这类纯番号文件夹。
+        # 注：「s蓝光原盘」等纯描述性文件夹也会被纳入，但只有按该名检索时才会命中，影响极小，
+        # 换取对常见「声母+日文名」命名的识别。
+        actor_names = [a for a in actor_names
+                       if a.get('japanese_name') and not a['japanese_name'].isascii()]
+        if not actor_names:
             return None
         return {'initial': initial, 'actor_names': actor_names}
 
@@ -4703,12 +4776,12 @@ class WebGrabTab:
         candidates: List[Tuple[str, str, str, str]] = []
         seen: Set[Tuple[str, str, str, str]] = set()
         for record in records:
-            if not record.get('is_actor_folder'):
-                continue
             folder = str(record.get('folder_name') or '').strip()
             path = str(record.get('file_path') or '').strip()
             if not folder or not path:
                 continue
+            # 演员文件夹本身，或其所属演员（由父目录推导、挂在 record 上的演员名）
+            # 都参与匹配，使位于演员文件夹内的视频文件夹也能按演员名命中
             for item in (record.get('actor_names') or []):
                 jp = str(item.get('japanese_name') or '').strip()
                 cn = str(item.get('chinese_name') or '').strip()
@@ -7154,16 +7227,17 @@ class WebGrabTab:
             return False
 
     def _on_save_dir_edit_done(self, event=None):
-        """保存目录编辑结束（失焦/回车）时，分隔符统一为 \\ 并逐级创建缺失目录"""
+        """保存目录编辑结束（失焦/回车）时，仅把分隔符统一为 Windows 反斜杠 \\。
+
+        注意：此处**不**逐级创建文件夹——创建目录只在点击“创建视频文件夹”按钮时进行，
+        文本框的任何编辑/失焦/回车都不会触发目录创建。
+        """
         path = self.save_path_var.get().strip()
         if not path:
             return
         norm = self._format_display_path(path)
         if norm != path:
             self.save_path_var.set(norm)      # 手工输入 Z:/a/b → 显示 Z:\a\b
-            path = norm
-        if not os.path.isdir(path):
-            self._ensure_save_dir(path)
 
     def _save_path_history(self) -> List[str]:
         """读取历史保存目录"""
@@ -7934,6 +8008,15 @@ class WebGrabTab:
         # 列表页设置（网址库 + 解析规则）
         self._load_list_config()
 
+        # 列表页磁盘缓存容量上限（MB，默认 50），本地设置可改
+        try:
+            mb = int(section_config.get('list_cache_max_mb', 50) if section_config else 50)
+        except (TypeError, ValueError):
+            mb = 50
+        if mb < 1:
+            mb = 1
+        self._list_cache_max_bytes = mb * 1024 * 1024
+
     def _log(self, message: str):
         """记录日志（线程安全：后台线程调用时自动转交主线程执行）"""
         if threading.current_thread() is not threading.main_thread():
@@ -8278,6 +8361,11 @@ class WebGrabTab:
         :param host: 内容容器（滑入时整体平移的那个 Frame），界面元素都挂在它下面
         """
         win = self._list_win          # 层窗口本身：只用于挂窗口级绑定
+        # 打开列表层时按容量上限回收旧缓存（默认 50MB），避免历史缓存无限膨胀
+        try:
+            self._list_trim_cache()
+        except Exception:
+            pass
         # 左侧明显颜色边条：让弹出层边界与主窗口背景清楚地区分开
         tk.Frame(host, width=6, background=LIST_PANEL_EDGE_BG).pack(
             side=tk.LEFT, fill=tk.Y)
@@ -9465,8 +9553,14 @@ class WebGrabTab:
         return os.path.join(LIST_CACHE_DIR, 't_' + self._list_cache_key(url) + ext)
 
     def _list_trim_cache(self):
-        """缓存文件夹容量超过上限（20MB）时，自动删除最旧的缓存文件"""
+        """缓存文件夹容量超过上限时，自动删除最旧的缓存文件
+
+        上限取自 self._list_cache_max_bytes（由“本地设置 → 列表缓存上限(MB)”动态控制，
+        默认 50MB）；修改后立即生效，下次写入缓存或打开列表层时按新值清理超容文件。
+        """
         try:
+            max_bytes = max(1 * 1024 * 1024, int(getattr(self, '_list_cache_max_bytes', 0)
+                                                or LIST_CACHE_MAX_BYTES))
             files = []
             total = 0
             for fp in glob.glob(os.path.join(LIST_CACHE_DIR, '*')):
@@ -9477,17 +9571,18 @@ class WebGrabTab:
                         total += st.st_size
                 except OSError:
                     pass
-            if total <= LIST_CACHE_MAX_BYTES:
+            if total <= max_bytes:
                 return
             files.sort()       # 按修改时间从旧到新依次清理
             for _, size, fp in files:
-                if total <= LIST_CACHE_MAX_BYTES:
+                if total <= max_bytes:
                     break
                 try:
                     os.remove(fp)
                     total -= size
                 except OSError:
                     pass
+            self._log(f"列表缓存已按上限 {max_bytes // (1024 * 1024)}MB 清理，当前约 {total // (1024 * 1024)}MB")
         except Exception:
             pass
 

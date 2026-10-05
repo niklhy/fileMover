@@ -71,7 +71,7 @@
   "web_grab": {
     "max_images": 0,
     "auto_download": false,
-    "save_path": "Z:\\下载\\202608\\系列\\z製作商：豊彦\\SEX依存症の女)",
+    "save_path": "Z:\\下载\\202610\\系列\\g港区女子",
     "main_image_selector": "div.movie a.bigImage",
     "sample_image_selector": "div#sample-waterfall",
     "sample_link_selector": "a.sample-box",
@@ -81,16 +81,16 @@
     "magnet_ajax_path": "/ajax/uncledatoolsbyajax.php",
     "magnet_ajax_params": "gid={gid}&lang={lang}&img={img}&uc={uc}&floor={floor}",
     "save_path_history": [
-      "Z:\\下载\\202608\\系列\\z製作商：豊彦\\SEX依存症の女)",
-      "Z:\\下载\\202608\\系列\\z製作商：豊彦\\无系列",
-      "Z:\\下载\\202608\\系列\\z製作商：豊彦\\s射精制服美少女",
-      "Z:/下载/202608/系列\\z製作商：豊彦\\无系列",
-      "Z:/下载/202608/c潮崎ななみ(潮崎七海)",
-      "Z:/下载/202608/q七沢みあ(七泽美亚)",
-      "Z:/下载/202608/q七ツ森りり(七森莉莉)",
-      "Z:/下载/202608/无系列",
-      "Z:/下载/202608/b白河花清",
-      "Z:/下载/202608/h河合あすな(河合明日菜)"
+      "Z:\\下载\\202610\\系列\\g港区女子",
+      "Z:\\下载\\202610\\c彩月七緒",
+      "Z:\\下载\\202610\\j結城りの(结城莉乃)",
+      "Z:\\下载\\202610\\c春日々音(春日音)",
+      "Z:\\下载\\202610\\s三佳詩",
+      "Z:\\下载\\202610\\b白間兎花",
+      "Z:\\下载\\202610\\系列\\y一流ホテルウーマン上品おま○こ激ピストン中出しレ×プ乱交映像(一流酒店女员工高雅小穴激烈抽插中出强×暴乱交视频)",
+      "Z:\\下载\\202610\\系列\\tラグジュTV(豪华电视)",
+      "Z:\\下载\\202610\\b百田光希",
+      "Z:\\下载\\202610\\t天宮花南"
     ],
     "field_rules": [
       {
@@ -156,6 +156,14 @@
         "rule_content": "node = soup.find('span', class_='header', string='製作商:')\nresult = ''\nif node:\n    sib = node.next_sibling\n    if sib is not None:\n        result = sib.get_text(strip=True) if hasattr(sib, 'get_text') else str(sib).strip()\n    if not result and node.find_next_sibling() is not None:\n        s2 = node.find_next_sibling()\n        result = s2.get_text(strip=True) if hasattr(s2, 'get_text') else str(s2).strip()",
         "multiple": false,
         "enabled": true
+      },
+      {
+        "field_id": "categories",
+        "field_name": "類別",
+        "rule_type": "custom",
+        "rule_content": "def own_text(tag):\n    parts = [s for s in tag.find_all(string=True, recursive=False) if isinstance(s, str)]\n    return ' '.join([p.strip() for p in parts]).strip()\n\nheader = None\nfor tag in soup.find_all(True):\n    if tag.name in ('a', 'script', 'style'):\n        continue\n    if '類別' in own_text(tag):\n        header = tag\n        break\nresult = []\nif header is not None:\n    block = None\n    node = header\n    tried = 0\n    while node is not None and tried < 5:\n        node = node.find_next_sibling()\n        tried += 1\n        if node is None:\n            break\n        if node.find('a', href=True) is not None:\n            block = node\n            break\n    if block is not None:\n        for a in block.find_all('a', href=True):\n            name = a.get_text(strip=True)\n            if name and name not in result:\n                result.append(name)",
+        "multiple": true,
+        "enabled": true
       }
     ],
     "multi_link": true,
@@ -201,13 +209,13 @@
     "list_auto_collect": true,
     "list_render_js": false,
     "list_config_version": 3,
-    "list_last_url": "https://www.javbus.casa/studio/eo",
-    "list_last_page": 75,
+    "list_last_url": "https://www.javbus.casa/genre/e/3",
+    "list_last_page": 3,
     "list_tabs": [
       {
         "name": "全部列表",
-        "url": "https://www.busfan.cyou/page/165",
-        "page": 165
+        "url": "https://www.busfan.cyou/page/162",
+        "page": 162
       },
       {
         "name": "拘束类型",
@@ -215,14 +223,14 @@
         "page": 75
       },
       {
-        "name": "制作商-豊彦",
-        "url": "https://www.javbus.casa/studio/eo",
-        "page": 1
+        "name": "類別-巨乳",
+        "url": "https://www.javbus.casa/genre/e/3",
+        "page": 3
       }
     ],
     "list_active_tab": 2,
     "list_search_path": "/search/{keyword}",
-    "list_active_host": "https://www.javbus.casa",
+    "list_active_host": "https://www.busfan.cyou",
     "list_pages_shown": "1",
     "list_wildcard_pad": "",
     "local_folder_scopes": {
@@ -237,13 +245,14 @@
       "Z:\\下载\\202607\\0新下载",
       "Z:\\下载\\202607\\已下载"
     ],
-    "compare_source_folder": "F:\\other\\changeDODE\\no\\20260802",
+    "compare_source_folder": "F:\\other\\changeDODE\\no\\20260801",
     "compare_target_folder": "F:\\other\\changeDODE\\OK",
     "compare_recursive": false,
     "compare_video_only": true,
     "compare_source_history": [
-      "F:\\other\\changeDODE\\no\\20260802",
-      "F:\\other\\changeDODE\\no\\20260801"
+      "F:\\other\\changeDODE\\no\\20260801",
+      "F:\\other\\changeDODE\\no\\20260803",
+      "F:\\other\\changeDODE\\no\\20260802"
     ],
     "compare_target_history": [
       "F:\\other\\changeDODE\\OK",
@@ -256,16 +265,16 @@
     "resolution": "1280x720",
     "orientation": "横向",
     "aspect": "保持原比例",
-    "bitrate": 1000,
+    "bitrate": 2500,
     "concurrency": 3,
-    "after_done": "无操作",
+    "after_done": "睡眠",
     "precision": "0.1S",
     "ffmpeg_path": "C:\\Program Files\\ffmpeg\\bin\\ffmpeg.EXE",
     "encoder": "auto",
     "subtitle": "软字幕·封装（随转码）",
     "del_src": false,
-    "del_srt": true,
-    "overwrite_src": true
+    "del_srt": false,
+    "overwrite_src": false
   },
   "external_tools": {
     "tools": [

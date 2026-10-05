@@ -27,6 +27,7 @@ from folder_check_tab import FolderCheckTab  # 文件夹检查/文件比对合�
 from web_grab_tab import (  # 网页图片抓取tab
     WebGrabTab, ensure_cuda_dll_path, translation_env_report,
 )
+from subtitle_tab import SubtitleTab  # 视频语音识别并翻译为字幕tab（可独立运行：python subtitle_tab.py）
 # 顶部外部工具按钮区（可在外部工具管理窗口中修改脚本路径）
 from external_tool_launcher import ExternalToolLauncher
 
@@ -148,6 +149,11 @@ class FileMoverGUI:
         web_grab_tab = WebGrabTab(self.notebook, controller=self)
         self.tabs['web_grab'] = web_grab_tab
         self.notebook.add(web_grab_tab.frame, text="网页抓取(web_grab)")
+
+        # 视频语音识别并翻译为字幕 Tab（原「日剧语音转中文字幕工具」移植）
+        subtitle_tab = SubtitleTab(self.notebook, controller=self)
+        self.tabs['subtitle'] = subtitle_tab
+        self.notebook.add(subtitle_tab.get_frame(), text="视频转字幕(subtitle_tab)")
 
         # 4. 操作日志选项卡（必须最后初始化，因为其他tab可能调用它记录日志）
         log_tab = LogTab(self.notebook, controller=self)

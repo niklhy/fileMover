@@ -93,6 +93,7 @@ class StandaloneController:
             "directory": "", "mode": "flatten", "all_subfolders": False,
             "only_video": True, "dry_run": True,
             "folder_b": "", "finish_action": FINISH_NONE, "folder_whole": True,
+            "folder_b_history": [],
         }}
         try:
             if os.path.exists(self.config_file):
@@ -147,6 +148,9 @@ class FileMoveTab:
         self._task_thread: Optional[threading.Thread] = None
         self._pause = threading.Event()         # 置位=运行，清零=暂停
         self._cur_task: Optional[dict] = None   # 当前正在执行的任务
+
+        # 目标文件夹历史（最多 6 条）：点“保存设置”或以该路径创建过移动任务才记录
+        self._folder_b_history: List[str] = []
 
         self.frame = ttk.Frame(parent)
         self._build_ui(self.frame)
@@ -229,12 +233,14 @@ class FileMoveTab:
         f = ttk.LabelFrame(parent, text="二、文件移动到目标文件夹（支持拖放 / 任务队列）")
         f.pack(fill=tk.X, padx=10, pady=6)
 
-        # 目标文件夹
+        # 目标文件夹（点击输入框弹出历史路径选择层）
         row = ttk.Frame(f)
         row.pack(fill=tk.X, padx=8, pady=4)
         ttk.Label(row, text="目标文件夹:").pack(side=tk.LEFT, padx=(0, 5))
         self.b_dir_var = tk.StringVar()
-        ttk.Entry(row, textvariable=self.b_dir_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        self.b_dir_entry = ttk.Entry(row, textvariable=self.b_dir_var)
+        self.b_dir_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        self.b_dir_entry.bind('<Button-1>', lambda e: self._show_folder_history())
         ttk.Button(row, text="浏览...", command=self._browse_b).pack(side=tk.LEFT, padx=2)
 
         # 文件列表（拖放目标，四列显示，点击表头排序）
@@ -312,8 +318,15 @@ class FileMoveTab:
         tf = ttk.LabelFrame(parent, text="任务清单（按顺序逐个执行）")
         tf.pack(fill=tk.X, padx=8, pady=4)
 
+        # 左右可拖动分隔：左侧任务列表，右侧按钮竖排（不横向挤占列表宽度）
+        pane = ttk.Panedwindow(tf, orient=tk.HORIZONTAL)
+        pane.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
+
+        # 左侧：任务列表（宽度可通过拖动分隔条调整）
+        list_side = ttk.Frame(pane)
+        pane.add(list_side, weight=4)
         tcols = ("idx", "count", "target", "status")
-        self.task_tree = ttk.Treeview(tf, columns=tcols, show="headings",
+        self.task_tree = ttk.Treeview(list_side, columns=tcols, show="headings",
                                       selectmode=tk.EXTENDED, height=5)
         thead = {"idx": "任务", "count": "进度", "target": "目标文件夹", "status": "状态"}
         twidth = {"idx": 60, "count": 90, "target": 420, "status": 150}
@@ -322,19 +335,24 @@ class FileMoveTab:
             self.task_tree.column(c, width=twidth[c],
                                   anchor=tk.CENTER if c in ("idx", "count") else tk.W,
                                   stretch=(c == "target"))
-        tbar = ttk.Scrollbar(tf, orient=tk.VERTICAL, command=self.task_tree.yview)
+        tbar = ttk.Scrollbar(list_side, orient=tk.VERTICAL, command=self.task_tree.yview)
         self.task_tree.configure(yscrollcommand=tbar.set)
         self.task_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, pady=2)
         tbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        row = ttk.Frame(tf)
-        row.pack(fill=tk.X, pady=2)
-        self.b_run_sel_btn = ttk.Button(row, text="执行选中", command=self._run_selected, width=10)
-        self.b_run_sel_btn.pack(side=tk.LEFT, padx=2)
-        self.b_run_all_btn = ttk.Button(row, text="执行全部", command=self._run_all, width=10)
-        self.b_run_all_btn.pack(side=tk.LEFT, padx=2)
-        ttk.Button(row, text="删除任务", command=self._delete_task, width=10).pack(side=tk.LEFT, padx=2)
-        ttk.Button(row, text="清空任务", command=self._clear_tasks, width=10).pack(side=tk.LEFT, padx=2)
+        # 右侧：按钮上下排列
+        btn_side = ttk.Frame(pane, padding=(6, 0))
+        pane.add(btn_side, weight=0)
+        self.b_run_sel_btn = ttk.Button(btn_side, text="执行选中", command=self._run_selected,
+                                        width=10)
+        self.b_run_sel_btn.pack(fill=tk.X, pady=(6, 2))
+        self.b_run_all_btn = ttk.Button(btn_side, text="执行全部", command=self._run_all,
+                                        width=10)
+        self.b_run_all_btn.pack(fill=tk.X, pady=2)
+        ttk.Button(btn_side, text="删除任务", command=self._delete_task,
+                   width=10).pack(fill=tk.X, pady=2)
+        ttk.Button(btn_side, text="清空任务", command=self._clear_tasks,
+                   width=10).pack(fill=tk.X, pady=2)
 
     def _build_log(self, parent):
         f = ttk.LabelFrame(parent, text="操作日志")
@@ -367,6 +385,61 @@ class FileMoveTab:
         d = filedialog.askdirectory(title="选择目标文件夹")
         if d:
             self.b_dir_var.set(bs(d))
+
+    # ---------- 目标文件夹历史（最多 6 条） ----------
+    def _remember_folder_b(self, path: str):
+        """记录目标文件夹到历史（去重置顶，最多 6 条）。
+        仅在点“保存设置”或以该路径创建过移动任务时调用。"""
+        path = bs(str(path or '')).strip()
+        if not path:
+            return
+        hist = [p for p in self._folder_b_history if p.lower() != path.lower()]
+        hist.insert(0, path)
+        self._folder_b_history = hist[:6]
+
+    def _show_folder_history(self):
+        """点击目标文件夹输入框时弹出历史路径选择层（下拉菜单样式），
+        选择后即可切换；没有历史时不弹出"""
+        hist = list(getattr(self, '_folder_b_history', []) or [])
+        if not hist:
+            return
+        root = self.frame.winfo_toplevel()
+        menu = tk.Menu(root, tearoff=0)
+        menu.add_command(label="历史目标文件夹（点击切换）：", state=tk.DISABLED)
+        for path in hist:
+            menu.add_command(label=path,
+                             command=lambda p=path: self._pick_folder_history(p))
+
+        entry = getattr(self, 'b_dir_entry', None)
+        try:
+            menu.update_idletasks()
+            h = menu.winfo_reqheight()
+        except Exception:
+            h = 0
+        try:
+            if entry is not None and entry.winfo_exists():
+                pos_x = entry.winfo_rootx()
+                pos_y = entry.winfo_rooty() + entry.winfo_height()   # 弹在输入框下方
+                if pos_y + h > root.winfo_screenheight():            # 下方放不下则弹在上方
+                    pos_y = max(0, entry.winfo_rooty() - h)
+            else:
+                pos_x = self.frame.winfo_rootx() + 60
+                pos_y = self.frame.winfo_rooty() + 100
+        except Exception:
+            pos_x, pos_y = 100, 100
+        try:
+            menu.tk_popup(pos_x, pos_y)
+        finally:
+            try:
+                menu.grab_release()
+            except Exception:
+                pass
+
+    def _pick_folder_history(self, path: str):
+        """选中历史路径：填入输入框并置顶历史"""
+        self._remember_folder_b(path)
+        self.b_dir_var.set(path)
+        self._log(f"[目标文件夹] 已切换为历史路径：{path}")
 
     # ============================ 区块一：文件夹整理 ============================
     def _start_a(self):
@@ -665,6 +738,7 @@ class FileMoveTab:
             messagebox.showwarning("警告", "请设置目标文件夹")
             return
         task = self._new_task(files, target)
+        self._remember_folder_b(target)   # 以该路径创建过任务，记入历史
         self._log(f"[任务] 已创建 #{task['id']}：{len(files)} 项 -> {bs(target)}")
         self.b_status.configure(text=f"已创建任务 #{task['id']}，可继续添加下一个任务")
         self._b_clear_files()   # 清空清单，便于继续设置下一个任务
@@ -682,6 +756,7 @@ class FileMoveTab:
         if not messagebox.askyesno("确认", f"确定将列表中 {len(files)} 项移动到：\n{target} ？"):
             return
         task = self._new_task(files, target)
+        self._remember_folder_b(target)   # 以该路径创建过任务，记入历史
         self._b_clear_files()
         self._run_queue([task["id"]])
 
@@ -889,8 +964,15 @@ class FileMoveTab:
         self.folder_whole_var.set(cfg.get("folder_whole", True))
         self.finish_var.set(FINISH_LABELS.get(cfg.get("finish_action", FINISH_NONE),
                                               FINISH_LABELS[FINISH_NONE]))
+        try:
+            hist = cfg.get("folder_b_history", []) or []
+            self._folder_b_history = [bs(str(p)) for p in hist if str(p).strip()][:6]
+        except Exception:
+            self._folder_b_history = []
 
     def _save_config(self):
+        # 点“保存设置”时把当前目标文件夹记入历史（非空才记录）
+        self._remember_folder_b(self.b_dir_var.get())
         config = {CONFIG_SECTION: {
             "directory": bs(self.dir_var.get()),
             "mode": self.mode_var.get(),
@@ -899,6 +981,7 @@ class FileMoveTab:
             "dry_run": self.dry_run_var.get(),
             "folder_b": bs(self.b_dir_var.get()),
             "folder_whole": self.folder_whole_var.get(),
+            "folder_b_history": list(self._folder_b_history),
             "finish_action": {v: k for k, v in FINISH_LABELS.items()}.get(
                 self.finish_var.get(), FINISH_NONE),
         }}

@@ -46,100 +46,9 @@ except ImportError:
     print("[FolderCheckTab] 警告: 无法导入 pattern_matcher，番号匹配功能将不可用")
 
 # ============ 右下角浮出式提醒（Toast 通知） ============
-class ToastNotifier:
-    """右下角浮出式提醒管理器（单例）
+# 实现已抽取到公共模块 toast.py，供所有选项卡复用（右下角浮出、自动消失、可堆叠）
+from toast import ToastNotifier, show_toast  # noqa: E402,F401
 
-    以无边框、置顶的小窗口在屏幕右下角浮出提醒信息，自动消失；
-    多条提醒会自下而上堆叠，用于替代频繁弹出的 messagebox 提示窗口。
-    """
-    _instance = None
-    _lock = threading.Lock()
-
-    _COLORS = {
-        'info':    ('#2b2b2b', '#f2f2f2', '#4a90d9'),  # (背景, 文字, 边框/图标)
-        'success': ('#1f5130', '#eafbe7', '#37a862'),
-        'warning': ('#5a3d00', '#fff4d6', '#e0a200'),
-        'error':   ('#5a1d1d', '#ffe3e3', '#e04848'),
-    }
-    _ICON = {'info': 'ℹ', 'success': '✔', 'warning': '!', 'error': '✕'}
-
-    def __new__(cls):
-        if cls._instance is None:
-            with cls._lock:
-                if cls._instance is None:
-                    cls._instance = super().__new__(cls)
-                    cls._instance._toasts = []
-        return cls._instance
-
-    def notify(self, ref_widget, message, level='info', duration=3200):
-        colors = self._COLORS.get(level, self._COLORS['info'])
-        bg, fg, border = colors
-        root = None
-        try:
-            root = ref_widget.winfo_toplevel()
-        except Exception:
-            root = None
-        win = tk.Toplevel(root)
-        win.wm_overrideredirect(True)
-        try:
-            win.wm_attributes('-topmost', True)
-            win.wm_attributes('-alpha', 0.96)
-        except Exception:
-            pass
-        inner = tk.Frame(win, bg=bg, highlightbackground=border, highlightthickness=2)
-        inner.pack(padx=0, pady=0)
-        icon = self._ICON.get(level, self._ICON['info'])
-        tk.Label(inner, text=icon, bg=bg, fg=border,
-                 font=('Microsoft YaHei UI', 12, 'bold')).pack(side='left', padx=(12, 6), pady=10)
-        tk.Label(inner, text=message, bg=bg, fg=fg, justify='left',
-                 font=('Microsoft YaHei UI', 10), wraplength=300,
-                 padx=(0, 12), pady=10).pack(side='left')
-        win.update_idletasks()
-        self._toasts.append((win, root))
-        self._relayout()
-        try:
-            win.after(duration, lambda w=win: self._close(w))
-        except Exception:
-            pass
-
-    def _relayout(self):
-        """在主窗口右下角自下而上堆叠所有 toast，并保证不超出窗口边界"""
-        try:
-            offset = 14
-            for win, root in self._toasts:
-                if not win.winfo_exists():
-                    continue
-                w = win.winfo_width()
-                h = win.winfo_height()
-                if root is not None and root.winfo_exists():
-                    # 以主窗口在屏幕坐标系中的矩形为锚点
-                    right = root.winfo_rootx() + root.winfo_width()
-                    bottom = root.winfo_rooty() + root.winfo_height()
-                    top = root.winfo_rooty()
-                else:
-                    # 回退：以屏幕为锚点
-                    right = win.winfo_screenwidth()
-                    bottom = win.winfo_screenheight()
-                    top = 0
-                x = right - w - 18
-                y = bottom - h - 18 - offset
-                # 不超出窗口上边界（堆叠过多时停靠在窗口顶部下方）
-                if y < top + 18:
-                    y = top + 18
-                win.geometry(f"+{x}+{y}")
-                offset += h + 8
-        except Exception:
-            pass
-
-    def _close(self, win):
-        try:
-            if win.winfo_exists():
-                win.destroy()
-        except Exception:
-            pass
-        self._toasts = [(t, r) for (t, r) in self._toasts
-                        if t is not win and t.winfo_exists()]
-        self._relayout()
 
 # ============ 配置管理器导入（与 file_compare_tab 保持兼容的单例） ============
 try:
@@ -208,7 +117,9 @@ except ImportError:
 # 用途：为"未转码文件"列表提供与 Windows 资源管理器一致的列数据
 #   · 文件类型     -> Shell API(SHGetFileInfoW)，与资源管理器"类型"列一致
 #   · 帧宽度/帧高度/数据速率 -> Windows 属性系统(System.Video.FrameWidth /
-#                    FrameHeight / TotalBitrate)，即资源管理器中的同名属性
+#                    FrameHeight / EncodingBitrate)，即资源管理器中的同名属性
+#                    "数据速率"只统计视频流（TotalBitrate 才是视频+音频），
+#                    与视频转码模块的"视频码率"设置口径保持一致
 # 实现：全部通过 ctypes 调用系统 API（不依赖 pywin32）；
 #       任何一步失败都会安全降级（改用 cv2 读取，再不行留空），不会崩溃。
 # =====================================================================
@@ -277,11 +188,14 @@ if _IS_WINDOWS:  # pragma: no cover - 以下实现仅用于 Windows
                                   (0xAB, 0x2E, 0x9B, 0x18, 0x60, 0x31, 0x0C, 0x93))
     # 视频属性集 {64440491-4C8B-11D1-8B70-080036B11A03}：
     #   pid 3 = System.Video.FrameWidth   pid 4 = System.Video.FrameHeight
-    #   pid 43 = System.Video.TotalBitrate（资源管理器"数据速率"，单位 bps）
+    #   pid 8  = System.Video.EncodingBitrate（资源管理器"数据速率 / Data rate"，仅视频，bps）
+    #   pid 43 = System.Video.TotalBitrate（资源管理器"总比特率"＝视频+音频，bps）
+    #   本工具按"视频码率"统一口径，优先取 pid 8
     _FMTID_VIDEO = _make_guid(0x64440491, 0x4C8B, 0x11D1,
                               (0x8B, 0x70, 0x08, 0x00, 0x36, 0xB1, 0x1A, 0x03))
     _PKEY_FRAME_WIDTH = _PROPERTYKEY(_FMTID_VIDEO, 3)
     _PKEY_FRAME_HEIGHT = _PROPERTYKEY(_FMTID_VIDEO, 4)
+    _PKEY_VIDEO_BITRATE = _PROPERTYKEY(_FMTID_VIDEO, 8)
     _PKEY_TOTAL_BITRATE = _PROPERTYKEY(_FMTID_VIDEO, 43)
 
     def _com_init() -> bool:
@@ -384,6 +298,7 @@ if _IS_WINDOWS:  # pragma: no cover - 以下实现仅用于 Windows
 
             for key_name, key in (('width', _PKEY_FRAME_WIDTH),
                                   ('height', _PKEY_FRAME_HEIGHT),
+                                  ('video_bitrate', _PKEY_VIDEO_BITRATE),
                                   ('bitrate', _PKEY_TOTAL_BITRATE)):
                 pv = _PROPVARIANT()
                 try:
@@ -461,7 +376,9 @@ def get_media_properties(path: str, file_size: int = 0):
         props = shell_media_props(path)
         width = props.get('width')
         height = props.get('height')
-        bitrate = props.get('bitrate')
+        # 统一按"视频码率"口径：优先 System.Video.EncodingBitrate（资源管理器"数据速率"），
+        # 取不到才退回 System.Video.TotalBitrate（视频+音频）
+        bitrate = props.get('video_bitrate') or props.get('bitrate')
     if width is None or height is None or bitrate is None:
         w2, h2, b2 = _cv2_media_props(path, file_size)
         width = width if width is not None else w2
@@ -858,7 +775,8 @@ class FolderCheckTab:
         btn_frame = ttk.Frame(self.frame)
         btn_frame.grid(row=2, column=0, sticky="ew", padx=10, pady=5)
 
-        self.save_btn = ttk.Button(btn_frame, text="💾 保存配置", command=self._save_config)
+        self.save_btn = ttk.Button(btn_frame, text="💾 保存配置",
+                                   command=lambda: self._save_config(show_tip=True))
         self.save_btn.pack(side=tk.LEFT, padx=(0, 10))
 
         self.run_btn = ttk.Button(btn_frame, text="▶ 开始执行", command=self._run)
@@ -1108,10 +1026,14 @@ class FolderCheckTab:
         unmatched_toolbar = ttk.Frame(unmatched_frame)
         unmatched_toolbar.grid(row=0, column=0, columnspan=2, sticky="ew", padx=2, pady=2)
         self.add_to_transcode_btn = ttk.Button(
-            unmatched_toolbar, text="➕ 添加到视频转码列表",
+            unmatched_toolbar, text="➕ 添加选中到转码列表",
             command=self._add_selected_to_transcode)
         self.add_to_transcode_btn.pack(side=tk.LEFT, padx=2)
-        ttk.Label(unmatched_toolbar, text="（选中列表中的视频后点击，可批量加入转码队列）",
+        self.add_all_to_transcode_btn = ttk.Button(
+            unmatched_toolbar, text="📥 添加全部文件",
+            command=self._add_all_to_transcode)
+        self.add_all_to_transcode_btn.pack(side=tk.LEFT, padx=2)
+        ttk.Label(unmatched_toolbar, text="（选中后可批量加入转码队列；“添加全部文件”加入当前所有未转码文件）",
                   foreground="gray").pack(side=tk.LEFT, padx=4)
 
         self.unmatched_tree = ttk.Treeview(
@@ -1210,8 +1132,12 @@ class FolderCheckTab:
         if target_path:
             self.target_folder = Path(target_path)
 
-    def _save_config(self):
-        """保存两类模式的配置到 app_config.json"""
+    def _save_config(self, show_tip: bool = False):
+        """保存两类模式的配置到 app_config.json
+
+        show_tip: 仅当用户主动点击“保存配置”按钮时才显示提示；
+                  执行/对比等流程中的自动保存不弹提示（避免重复打扰）。
+        """
         config = {
             "check_folder": self.folder_var.get(),
             "check_include_subfolders": self.include_subfolders_var.get(),
@@ -1226,7 +1152,8 @@ class FolderCheckTab:
         }
         self.config_manager.set_section(self.CONFIG_SECTION, config, auto_save=True)
         self.log("[文件夹检查] 配置已保存")
-        self.show_toast("配置已保存", "success")
+        if show_tip:
+            self.show_toast("配置已保存", "success")
 
     # =====================================================================
     # 统一入口
@@ -2301,6 +2228,32 @@ class FolderCheckTab:
         self.show_toast(
             f"已将 {added} 个视频加入\"视频剪辑转码\"的待转码列表", "success")
         self.log(f"[文件夹检查/比对] 已把 {added} 个未转码视频加入转码列表")
+
+    def _add_all_to_transcode(self):
+        """将"未转码文件"列表中的全部视频加入"视频剪辑转码"的待转码列表"""
+        records = list(self.unmatched_rows.values())
+        if not records:
+            self.show_toast("没有未转码的文件，请先执行对比操作", "warning")
+            return
+        panel = self._get_transcode_panel()
+        if panel is None or not hasattr(panel, 'add_videos'):
+            self.show_toast("未找到\"视频剪辑转码\"面板，无法添加", "error")
+            return
+        paths = [r['path'] for r in records]
+        added = panel.add_videos(paths)  # 非视频文件会被面板自动过滤
+        if added == 0:
+            self.show_toast(
+                "全部文件均已存在于转码列表，或没有可添加的（视频）文件", "info")
+            return
+        # 跳转到转码面板，方便用户继续设置并开始转码
+        try:
+            grid_tab = self.controller.tabs['video_grid']
+            self.controller.notebook.select(grid_tab.frame)
+        except Exception:
+            pass
+        self.show_toast(
+            f"已将 {added} 个视频加入\"视频剪辑转码\"的待转码列表", "success")
+        self.log(f"[文件夹检查/比对] 已把全部 {added} 个未转码视频加入转码列表")
 
     # =====================================================================
     # 未转码列表：选择 / 排序 / 右键菜单 / 拖拽

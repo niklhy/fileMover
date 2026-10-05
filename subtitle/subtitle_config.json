@@ -1,0 +1,25 @@
+{
+  "model_root": "D:/软件编程/python/练习/20260722-视频语音识别并翻译为字幕",
+  "asr_engine": "kotoba-whisper",
+  "translator_engine": "Sakura-GalTransl-7B",
+  "whisper_model": "medium",
+  "ffmpeg_path": "",
+  "model_base_path": "D:/软件编程/python/练习/20260722-视频语音识别并翻译为字幕/语音模型/faster-whisper",
+  "translator_model_path": "D:/软件编程/python/练习/20260722-视频语音识别并翻译为字幕/翻译模型/NLLB-200/nllb-200-distilled-600M",
+  "sakura_model_path": "D:/软件编程/python/练习/20260722-视频语音识别并翻译为字幕/翻译模型/SakuraLLM/Sakura-14B-Qwen2.5-v1.0-GGUF/sakura-14b-qwen2.5-v1.0-q4km.gguf",
+  "sakura7b_model_path": "D:/软件编程/python/练习/20260722-视频语音识别并翻译为字幕/翻译模型/SakuraLLM/Sakura-7B-Qwen2.5-v1.0-GGUF/sakura-7b-qwen2.5-v1.0-iq4xs.gguf",
+  "galtransl_model_path": "D:/软件编程/python/练习/20260722-视频语音识别并翻译为字幕/翻译模型/SakuraLLM/Sakura-GalTransl-7B-v3.7/Sakura-Galtransl-7B-v3.7.gguf",
+  "sakura_mode": "均衡（推荐）",
+  "kotoba_model_path": "D:/软件编程/python/练习/20260722-视频语音识别并翻译为字幕/语音模型/kotoba-whisper-v2.1",
+  "nemo_model_path": "D:/软件编程/python/练习/20260722-视频语音识别并翻译为字幕/语音模型/reazonspeech-nemo-v2/reazonspeech-nemo-v2.nemo",
+  "model_paths": {
+    "base": "D:/软件编程/python/练习/20260722-视频语音识别并翻译为字幕/语音模型/faster-whisper/faster-whisper-base",
+    "small": "D:/软件编程/python/练习/20260722-视频语音识别并翻译为字幕/语音模型/faster-whisper/faster-whisper-small",
+    "medium": "D:/软件编程/python/练习/20260722-视频语音识别并翻译为字幕/语音模型/faster-whisper/faster-whisper-medium",
+    "large-v3": "D:/软件编程/python/练习/20260722-视频语音识别并翻译为字幕/语音模型/faster-whisper/faster-whisper-large-v3"
+  },
+  "after_finish_action": "none",
+  "scan_subfolders": true,
+  "bilingual": false,
+  "device": "cuda"
+}
