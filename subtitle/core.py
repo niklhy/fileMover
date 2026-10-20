@@ -357,6 +357,88 @@ class SubtitleGenerator:
             out[i][1] = max(end, out[i][0] + min_dur)
         return [(s, e, t) for (s, e, t) in out]
 
+    # ---- 首句字幕对齐到真实对话起点 ----
+    def _detect_speech_onset(self, audio_path, max_scan: float = 300.0):
+        """用音频能量定位第一处语音起始时刻（秒）；失败返回 None。
+
+        ASR（尤其 kotoba/nemo 的时间戳 token 机制）常把第一段的起点报为 0，
+        于是视频尚未开口字幕就已出现。这里以 20ms 帧 RMS 做简易能量门限检测，
+        要求连续约 100ms 超过阈值才算真正开始说话，避免把瞬时噪声当语音。
+        """
+        try:
+            import wave
+            import numpy as np
+        except Exception:
+            return None
+        try:
+            with wave.open(str(audio_path), 'rb') as w:
+                sr = w.getframerate()
+                ch = w.getnchannels()
+                sw = w.getsampwidth()
+                n = w.getnframes()
+                if sr <= 0 or n <= 0 or sw not in (1, 2, 4):
+                    return None
+                raw = w.readframes(min(n, int(max_scan * sr)))
+            if sw == 2:
+                data = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+            elif sw == 4:
+                data = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / 2147483648.0
+            else:
+                data = (np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
+            if ch > 1:
+                usable = (len(data) // ch) * ch
+                data = data[:usable].reshape(-1, ch).mean(axis=1)
+            win = max(1, int(sr * 0.02))          # 20ms 帧
+            frames = len(data) // win
+            if frames <= 0:
+                return None
+            rms = np.sqrt((data[:frames * win].reshape(frames, win) ** 2).mean(axis=1))
+            if rms.max() <= 0:
+                return None
+            noise = float(np.percentile(rms, 20))
+            thr = max(noise * 4.0, 0.008, float(rms.max()) * 0.03)
+            need = max(1, int(round(0.1 / 0.02)))   # 连续 100ms
+            run = 0
+            for i in range(frames):
+                run = run + 1 if rms[i] > thr else 0
+                if run >= need:
+                    return max(0.0, (i - need + 1) * 0.02)
+            return None
+        except Exception:
+            return None
+
+    def _align_first_segment_to_speech(self, segments, audio_path,
+                                       log=None):
+        """把首条字幕的起点收敛到真实对话起始时刻。
+
+        返回修正后的片段列表（元素为 list，便于就地修改）。
+        - 首段起点明显早于检测到的语音起点 → 收敛到该起点；
+        - 若语音起点已超过首段结束（该段整段都在静音里）→ 丢弃该段。
+        """
+        if not segments:
+            return segments
+        onset = self._detect_speech_onset(audio_path)
+        if onset is None:
+            return segments
+        segs = [list(s) for s in segments]
+        s0, e0 = float(segs[0][0]), float(segs[0][1])
+        if onset <= s0 + 0.05:
+            return segs                      # 首段起点已经不早于语音起点
+        if onset >= e0 - 0.2:
+            if log:
+                try:
+                    log(f"[字幕] 首段（{s0:.2f}s~{e0:.2f}s）整段位于静音中，已丢弃")
+                except Exception:
+                    pass
+            return segs[1:]
+        segs[0][0] = onset
+        if log:
+            try:
+                log(f"[字幕] 首句字幕起点已对齐到对话起始：{s0:.2f}s → {onset:.2f}s")
+            except Exception:
+                pass
+        return segs
+
     def _postprocess_segments(self, segments):
         """字幕段后处理：
         1) 折叠段内重复短语；2) 清理句首语气词，丢弃纯语气词（嗯/啊等）字幕段；
@@ -1026,7 +1108,8 @@ class SubtitleGenerator:
         return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
     def generate_srt(self, segments, output_path, bilingual=False,
-                       progress_callback=None, status_callback=None):
+                       progress_callback=None, status_callback=None,
+                       pause_callback=None):
         srt_lines = []
 
         # 先初始化翻译器
@@ -1042,6 +1125,13 @@ class SubtitleGenerator:
         for i, segment in enumerate(segments, 1):
             if self._cancelled:
                 return None
+
+            # 协作式暂停点：暂停时在此阻塞，恢复后从当前字幕继续（不影响已翻译结果）
+            if pause_callback:
+                try:
+                    pause_callback()
+                except Exception:
+                    pass
 
             seg_start, seg_end, ja_text = segment[0], segment[1], segment[2]
             ja_text = ja_text.strip()
@@ -1088,7 +1178,8 @@ class SubtitleGenerator:
         return output_path
 
     def process_video(self, video_path, output_srt=None, bilingual=False,
-                      progress_callback=None, status_callback=None):
+                      progress_callback=None, status_callback=None,
+                      pause_callback=None):
         """
         处理视频，支持详细的进度回调
         """
@@ -1129,6 +1220,12 @@ class SubtitleGenerator:
             if segment_list == "CANCELLED":
                 return "CANCELLED"
 
+            # 首句字幕对齐：ASR 常把第一段起点报为 0（尚无对话字幕就已出现），
+            # 用音频能量定位首个语音起点，把首段起点收敛到真正开口的时刻
+            if isinstance(segment_list, list) and segment_list:
+                segment_list = self._align_first_segment_to_speech(
+                    segment_list, temp_audio, log=status_callback)
+
             if status_callback:
                 status_callback("识别完成！检测到 " + str(len(segment_list)) + " 条语音片段")
             if progress_callback:
@@ -1142,7 +1239,8 @@ class SubtitleGenerator:
             result = self.generate_srt(
                 segment_list, output_srt, bilingual,
                 lambda p: progress_callback(70 + int(p * 0.28), STATUS_GENERATING) if progress_callback else None,
-                status_callback
+                status_callback,
+                pause_callback,
             )
 
             if result and not self._cancelled:
@@ -1176,6 +1274,28 @@ class SubtitleGenerator:
         self._tgt_bos_token_id = None
         self._translator_initialized = False
         release_gpu_memory()
+
+    def release_asr(self):
+        """仅释放语音识别模型（翻译任务仍可能继续使用显存），用于“后续工作不再需要语音模型”时回收显存"""
+        if self.model is not None or self.kotoba_processor is not None:
+            self.model = None
+            self.kotoba_processor = None
+            try:
+                release_gpu_memory()
+            except Exception:
+                pass
+
+    def release_translator(self):
+        """仅释放翻译模型（语音识别仍可能继续使用显存），用于“后续工作不再需要翻译模型”时回收显存"""
+        if self.translator is not None or self.translator_tokenizer is not None:
+            self.translator = None
+            self.translator_tokenizer = None
+            self._tgt_bos_token_id = None
+            self._translator_initialized = False
+            try:
+                release_gpu_memory()
+            except Exception:
+                pass
 
 
 # ============================================================

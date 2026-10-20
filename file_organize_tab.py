@@ -14,6 +14,7 @@
 8. 排除文件夹功能 - 可设置多个排除目录，遍历时跳过
 9. 【新增】中文字幕后缀识别（-c, -ch等，可配置）
 10. 【新增】无码后缀识别：-UC/-UNC 保留原后缀；-u/-Uncensored/-un/-ai 统一为 -Uncensored
+11. 【新增】无码基础上再附字幕识别：-Uncensored-C 同时保留 -Uncensored 与 -C（如 H800@ABW-289-Uncensored-C.mp4 -> ABW-289-Uncensored-C.mp4）
 """
 
 import tkinter as tk
@@ -27,8 +28,11 @@ import queue
 from pathlib import Path
 from typing import Optional, Dict, List, Set, Callable, Any, Tuple
 from dataclasses import dataclass, field, asdict
-from collections import defaultdict
+from collections import defaultdict, Counter
 from PIL import Image
+
+# 导入批量改名子功能（合并到同一选项卡的两个子功能之一）
+from file_batch_rename_tab import BatchRenameTab
 
 # 导入番号匹配器
 try:
@@ -112,10 +116,14 @@ except ImportError:
             ext = Path(original_filename).suffix
             suffixes = self.detect_all_suffixes(original_filename)
             suffix_part = ''
-            if suffixes['uncensored']:
-                suffix_part += suffixes['uncensored']
-            elif suffixes['chinese_subtitle']:
-                suffix_part += suffixes['chinese_subtitle']
+            uncensored = suffixes['uncensored']
+            chinese = suffixes['chinese_subtitle']
+            if uncensored:
+                suffix_part += uncensored
+                if chinese and uncensored not in ('-UC', '-UNC'):
+                    suffix_part += chinese
+            elif chinese:
+                suffix_part += chinese
             if total_in_group > 1:
                 return f"{code}{suffix_part}-{index}{ext}"
             else:
@@ -440,46 +448,63 @@ class FileOrganizeWorker:
             self.stats['errors'] += 1
             return False
 
-    def rename_video(self, video_path: Path, code: str, index: int, total_in_group: int = 1) -> Optional[Path]:
+    @staticmethod
+    def _build_suffix_part(suffixes: Dict[str, Optional[str]]) -> str:
+        """
+        根据后缀检测结果构建文件名后缀部分（不含统计）：
+        - -UC/-UNC 已包含中文字幕含义，不再附加 -C
+        - -Uncensored 基础上再附字幕（如 -Uncensored-C）时，两者都保留
+        """
+        suffix_part = ''
+        uncensored = suffixes['uncensored']
+        chinese = suffixes['chinese_subtitle']
+        if uncensored:
+            suffix_part += uncensored
+            if chinese and uncensored not in ('-UC', '-UNC'):
+                suffix_part += chinese
+        elif chinese:
+            suffix_part += chinese
+        return suffix_part
+
+    def rename_video(self, video_path: Path, code: str, index: int = 1,
+                     use_index: bool = False) -> Optional[Path]:
         """
         【修改】重命名视频文件
         使用 PatternMatcher 统一检测后缀：
         - 中文字幕：-c, -ch 等 -> 保留为 -C
         - -UC, -UNC -> 保留原后缀并转为大写
         - -u, -Uncensored, -un, -ai -> -Uncensored
+        - -Uncensored 基础上再附字幕（-Uncensored-C）-> 同时保留 -Uncensored 与 -C
+
+        【修改】仅当 use_index=True（即多个视频按规则处理后目标名相同）时
+        才添加数字后缀 -1、-2 等，目标名不相同的文件不再强制加序号
         """
         # 使用 PatternMatcher 检测所有后缀
         suffixes = self.matcher.detect_all_suffixes(video_path.name)
+        suffix_part = self._build_suffix_part(suffixes)
 
-        # 构建后缀部分
-        # 注意：-UC 和 -UNC 中的 C 已包含中文字幕含义，不会同时存在 -C-UC 组合
-        suffix_part = ''
+        # 统计
         if suffixes['uncensored']:
-            # -UC 或 -UNC 已包含中文字幕含义
-            suffix_part += suffixes['uncensored']
             self.stats['uncensored_count'] += 1
-            # 仅 UC/UNC 中的 C 代表中文字幕，其他无码后缀不计入中文字幕
-            if suffixes['uncensored'] in ('-UC', '-UNC'):
-                self.stats['chinese_subtitle_count'] += 1
-        elif suffixes['chinese_subtitle']:
-            # 仅中文字幕
-            suffix_part += suffixes['chinese_subtitle']
+        # -UC/-UNC 中的 C 已代表中文字幕；单独的 -C 或 -Uncensored-C 组合也计入
+        if suffixes['chinese_subtitle'] or suffixes['uncensored'] in ('-UC', '-UNC'):
             self.stats['chinese_subtitle_count'] += 1
 
+        base_stem = f"{code}{suffix_part}"
+
         # 构建新文件名
-        if total_in_group > 1:
-            new_name = f"{code}{suffix_part}-{index}{video_path.suffix}"
+        if use_index:
+            new_name = f"{base_stem}-{index}{video_path.suffix}"
         else:
-            new_name = f"{code}{suffix_part}{video_path.suffix}"
+            new_name = f"{base_stem}{video_path.suffix}"
 
         new_path = video_path.parent / new_name
 
-        # 处理重名
-        counter = index
-        stem, suffix_ext = new_path.stem, new_path.suffix
+        # 处理重名（目标名与已有文件冲突时递增序号）
+        counter = index if use_index else 0
         while new_path.exists() and new_path != video_path:
             counter += 1
-            new_name = f"{code}{suffix_part}-{counter}{suffix_ext}"
+            new_name = f"{base_stem}-{counter}{video_path.suffix}"
             new_path = video_path.parent / new_name
 
         if self.config.dry_run:
@@ -504,19 +529,21 @@ class FileOrganizeWorker:
             self.stats['errors'] += 1
             return None
 
-    def rename_subtitle(self, subtitle_path: Path, new_stem: str, index: int, total_in_group: int = 1) -> Optional[Path]:
+    def rename_subtitle(self, subtitle_path: Path, new_stem: str, index: int = 1,
+                        use_index: bool = False) -> Optional[Path]:
         """
         【修改】重命名字幕文件
         字幕使用调用方已按自身文件名计算好的 new_stem
+        仅当 use_index=True（多个字幕目标名相同）时才添加数字后缀
         """
-        if total_in_group > 1:
+        if use_index:
             new_name = f"{new_stem}-{index}{subtitle_path.suffix}"
         else:
             new_name = f"{new_stem}{subtitle_path.suffix}"
 
         new_path = subtitle_path.parent / new_name
 
-        counter = index
+        counter = index if use_index else 0
         while new_path.exists() and new_path != subtitle_path:
             counter += 1
             new_name = f"{new_stem}-{counter}{subtitle_path.suffix}"
@@ -666,31 +693,42 @@ class FileOrganizeWorker:
         # 按原始文件名排序视频和字幕，确保对应关系
         sorted_videos = sorted(videos, key=lambda x: x.name.lower())
         sorted_subtitles = sorted(subtitles, key=lambda x: x.name.lower())
-        total_videos = len(sorted_videos)
 
         # 处理视频
+        # 【优化】先计算每个视频按规则得到的目标基础名（不含序号），
+        # 仅当多个视频的目标名相同时才添加数字后缀区分，目标名不同则不加序号
         if videos and self.config.rename_video and has_valid_code:
-            for idx, video_path in enumerate(sorted_videos, 1):
+            base_names = [f"{code}{self._build_suffix_part(self.matcher.detect_all_suffixes(v.name))}"
+                          for v in sorted_videos]
+            dup_counter = Counter(base_names)
+            group_seen: Dict[str, int] = defaultdict(int)
+            for video_path, base_name in zip(sorted_videos, base_names):
                 if not self.is_running:
                     return
-                result = self.rename_video(video_path, code, idx, total_videos)
+                if dup_counter[base_name] > 1:
+                    group_seen[base_name] += 1
+                    result = self.rename_video(video_path, code, group_seen[base_name], use_index=True)
+                else:
+                    result = self.rename_video(video_path, code, use_index=False)
                 if result is None and not self.config.dry_run:
                     has_rename_error = True
 
         # 处理字幕文件
         # 每个字幕文件按自身文件名检测后缀，避免错误继承视频的 -UC/-UNC 等后缀
+        # 【优化】同样仅在多个字幕的目标名相同时才添加数字后缀区分
         if subtitles and self.config.rename_subtitle and has_valid_code:
-            for idx, subtitle_path in enumerate(sorted_subtitles, 1):
+            sub_stems = [f"{code}{self._build_suffix_part(self.matcher.detect_all_suffixes(s.name))}"
+                         for s in sorted_subtitles]
+            sub_dup_counter = Counter(sub_stems)
+            sub_group_seen: Dict[str, int] = defaultdict(int)
+            for subtitle_path, sub_stem in zip(sorted_subtitles, sub_stems):
                 if not self.is_running:
                     return
-                suffixes = self.matcher.detect_all_suffixes(subtitle_path.name)
-                suffix_part = ''
-                if suffixes['uncensored']:
-                    suffix_part = suffixes['uncensored']
-                elif suffixes['chinese_subtitle']:
-                    suffix_part = suffixes['chinese_subtitle']
-                new_stem = f"{code}{suffix_part}"
-                result = self.rename_subtitle(subtitle_path, new_stem, idx, total_videos)
+                if sub_dup_counter[sub_stem] > 1:
+                    sub_group_seen[sub_stem] += 1
+                    result = self.rename_subtitle(subtitle_path, sub_stem, sub_group_seen[sub_stem], use_index=True)
+                else:
+                    result = self.rename_subtitle(subtitle_path, sub_stem, use_index=False)
                 if result is None and not self.config.dry_run:
                     has_rename_error = True
 
@@ -890,9 +928,15 @@ class FileOrganizeTab:
         """创建界面"""
         self.frame = ttk.Frame(self.parent)
 
+        # 子功能切换：文件名整理 / 批量改名（合并到同一选项卡）
+        self.sub_notebook = ttk.Notebook(self.frame)
+        self.sub_notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self.organize_frame = ttk.Frame(self.sub_notebook)
+        self.sub_notebook.add(self.organize_frame, text="文件名整理")
+
         # 功能说明 - 可折叠
         self.info_expanded = tk.BooleanVar(value=False)
-        info_frame = ttk.LabelFrame(self.frame, text="功能说明")
+        info_frame = ttk.LabelFrame(self.organize_frame, text="功能说明")
         info_frame.pack(fill=tk.X, padx=10, pady=2)
 
         info_header = ttk.Frame(info_frame)
@@ -908,11 +952,12 @@ class FileOrganizeTab:
         info_text = (
             "本工具用于整理视频和图片文件：\n"
             "1. 根据文件夹名称自动识别番号\n"
-            "2. 重命名视频文件为番号格式（多文件自动添加-1,-2后缀）\n"
+            "2. 重命名视频文件为番号格式（仅当多个视频的目标名相同时才添加-1,-2后缀）\n"
             "3. 自动识别并保留后缀：\n"
             "   - 中文字幕：-c, -ch 等 -> 保留为 -C\n"
             "   - 无码+中文字幕：-UC, -UNC -> 保留原后缀并转为大写（C已含中文字幕含义）\n"
             "   - 其他无码标记：-u, -Uncensored, -un, -ai -> -Uncensored\n"
+            "   - 无码基础上再附字幕：-Uncensored-C 同时保留 -Uncensored 与 -C\n"
             "4. 重命名字幕文件（.srt/.ass/.ssa/.vtt/.sub/.idx），字幕按自身文件名识别后缀\n"
             "5. 仅在识别到有效番号时，才将图片重命名为cover.jpg\n"
             "6. 自动转换webp、bmp格式为jpg\n"
@@ -924,7 +969,7 @@ class FileOrganizeTab:
         ttk.Label(self.info_content_frame, text=info_text, justify=tk.LEFT).pack(padx=10, pady=5, anchor=tk.W)
 
         # 源目录设置
-        dir_frame = ttk.LabelFrame(self.frame, text="源目录设置")
+        dir_frame = ttk.LabelFrame(self.organize_frame, text="源目录设置")
         dir_frame.pack(fill=tk.X, padx=10, pady=5)
 
         dir_row = ttk.Frame(dir_frame)
@@ -936,7 +981,7 @@ class FileOrganizeTab:
         ttk.Button(dir_row, text="浏览...", command=self._browse_directory).pack(side=tk.RIGHT)
 
         # ====== 排除目录设置 ======
-        exclude_frame = ttk.LabelFrame(self.frame, text="排除目录设置（选中的文件夹及其子文件夹将不会被处理）")
+        exclude_frame = ttk.LabelFrame(self.organize_frame, text="排除目录设置（选中的文件夹及其子文件夹将不会被处理）")
         exclude_frame.pack(fill=tk.X, padx=10, pady=5)
 
         exclude_top = ttk.Frame(exclude_frame)
@@ -958,7 +1003,7 @@ class FileOrganizeTab:
         exclude_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
         # ====== 【新增】后缀识别设置 ======
-        suffix_frame = ttk.LabelFrame(self.frame, text="后缀识别设置（用于标记视频特殊属性）")
+        suffix_frame = ttk.LabelFrame(self.organize_frame, text="后缀识别设置（用于标记视频特殊属性）")
         suffix_frame.pack(fill=tk.X, padx=10, pady=5)
 
         # 中文字幕设置
@@ -982,11 +1027,11 @@ class FileOrganizeTab:
         ttk.Label(uncensored_frame, text="(如: -UC, -UNC, -u, -Uncensored, -un, -ai)", foreground="gray").pack(side=tk.LEFT)
 
         # 说明标签
-        ttk.Label(suffix_frame, text="后缀规则: -UC/-UNC保留原后缀；-u/-Uncensored/-un/-ai统一为-Uncensored",
+        ttk.Label(suffix_frame, text="后缀规则: -UC/-UNC保留原后缀；-u/-Uncensored/-un/-ai统一为-Uncensored；-Uncensored-C 同时保留两者",
                  foreground="blue").pack(padx=10, pady=(0, 5))
 
         # 操作选项
-        option_frame = ttk.LabelFrame(self.frame, text="操作选项")
+        option_frame = ttk.LabelFrame(self.organize_frame, text="操作选项")
         option_frame.pack(fill=tk.X, padx=10, pady=5)
 
         # 使用网格布局 - 4列2行
@@ -1032,7 +1077,7 @@ class FileOrganizeTab:
                        variable=self.delete_garbage_var).grid(row=1, column=3, sticky=tk.W, padx=5, pady=2)
 
         # 进度条
-        progress_frame = ttk.LabelFrame(self.frame, text="操作进度")
+        progress_frame = ttk.LabelFrame(self.organize_frame, text="操作进度")
         progress_frame.pack(fill=tk.X, padx=10, pady=5)
 
         self.progress_bar = ttk.Progressbar(progress_frame, orient=tk.HORIZONTAL, 
@@ -1047,7 +1092,7 @@ class FileOrganizeTab:
 
         # 结果表格
         # ========== 底部操作栏 ==========
-        bottom_frame = ttk.Frame(self.frame)
+        bottom_frame = ttk.Frame(self.organize_frame)
         bottom_frame.pack(fill=tk.X, padx=10, pady=5)
 
         # 左侧：开始执行 / 停止
@@ -1072,7 +1117,7 @@ class FileOrganizeTab:
                   command=self._save_to_config_manager).pack(side=tk.RIGHT, padx=5)
 
         # 结果表格
-        table_frame = ttk.LabelFrame(self.frame, text="文件夹检查结果（异常状态清单）")
+        table_frame = ttk.LabelFrame(self.organize_frame, text="文件夹检查结果（异常状态清单）")
         table_frame.pack(fill=tk.BOTH, padx=10, pady=5)
 
         columns = ('folder_path', 'status')
@@ -1090,6 +1135,10 @@ class FileOrganizeTab:
 
         self.result_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # 批量改名子功能（复用 BatchRenameTab，作为同一选项卡下的第二个子功能）
+        self.batch_tab = BatchRenameTab(self.sub_notebook, controller=self)
+        self.sub_notebook.add(self.batch_tab.frame, text="批量改名")
 
     def _bind_events(self):
         """绑定配置自动保存事件"""

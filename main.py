@@ -21,13 +21,14 @@ from models import VideoConfig
 from move_videos_tab import MoveVideosTab
 from log_tab import LogTab
 from file_move_tab import FileMoveTab
-from file_organize_tab import FileOrganizeTab  # 文件操作tab
+from file_organize_tab import FileOrganizeTab  # 文件操作tab（内含“文件名整理”与“批量改名”两个子功能）
 from video_grid_tab import VideoGridTab # 视频缩略图tab
 from folder_check_tab import FolderCheckTab  # 文件夹检查/文件比对合并tab（含原 video_check 与 file_compare 功能）
 from web_grab_tab import (  # 网页图片抓取tab
     WebGrabTab, ensure_cuda_dll_path, translation_env_report,
 )
 from subtitle_tab import SubtitleTab  # 视频语音识别并翻译为字幕tab（可独立运行：python subtitle_tab.py）
+from workflow_tab import WorkflowTab  # 多任务串联工作流tab（可独立运行：python workflow_tab.py）
 # 顶部外部工具按钮区（可在外部工具管理窗口中修改脚本路径）
 from external_tool_launcher import ExternalToolLauncher
 
@@ -38,9 +39,13 @@ class FileMoverGUI:
         self.root = root
         self.root.title("文件移动工具 - 模块化版本")
         # 默认窗口尺寸：高度按屏幕自适应加高（不超过屏幕高度），保证底部操作按钮打开即可见
+        # 宽度加宽以容纳「工作流串联」选项卡的左右分栏（清单 + 流程/参数区）
         screen_h = self.root.winfo_screenheight()
+        screen_w = self.root.winfo_screenwidth()
         win_h = min(1100, max(950, screen_h - 100))
-        self.root.geometry(f"1200x{win_h}")
+        win_w = min(1520, max(1300, screen_w - 60))
+        self.root.geometry(f"{win_w}x{win_h}")
+        self.root.minsize(1280, 860)
         
         # 配置存储
         self.config = self._load_config()
@@ -130,10 +135,10 @@ class FileMoverGUI:
         move_tab = MoveVideosTab(self.notebook, controller=self)
         self.tabs['move_videos'] = move_tab
     
-        # 3. 文件整理 Tab（新增功能）
+        # 3. 文件整理 Tab（内含“文件名整理”与“批量改名”两个子功能）
         organize_tab = FileOrganizeTab(self.notebook, controller=self)
         self.tabs['file_organize'] = organize_tab
-        self.notebook.add(organize_tab.frame, text="文件名整理(file_organize)")
+        self.notebook.add(organize_tab.frame, text="文件名整理/批量改名(file_organize)")
 
         # 视频宫格缩略图 Tab
         grid_tab = VideoGridTab(self.notebook, controller=self)
@@ -154,6 +159,11 @@ class FileMoverGUI:
         subtitle_tab = SubtitleTab(self.notebook, controller=self)
         self.tabs['subtitle'] = subtitle_tab
         self.notebook.add(subtitle_tab.get_frame(), text="视频转字幕(subtitle_tab)")
+
+        # 多任务串联工作流：把移动/剪辑转码/字幕生成编排成一条可自动执行的流水线
+        workflow_tab = WorkflowTab(self.notebook, controller=self)
+        self.tabs['workflow'] = workflow_tab
+        self.notebook.add(workflow_tab.get_frame(), text="工作流串联(workflow_tab)")
 
         # 4. 操作日志选项卡（必须最后初始化，因为其他tab可能调用它记录日志）
         log_tab = LogTab(self.notebook, controller=self)

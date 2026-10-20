@@ -7,6 +7,25 @@
 import re
 from typing import Optional, Dict, List, Tuple
 
+# 番号深度学习库（与 workflow 模块共用同一份 uid_learn.json）
+# 懒加载并缓存，避免每次提取都读盘；循环导入安全（uid_learner 仅在函数内被引入）。
+_UID_LEARNER_CACHE = None
+
+
+def _get_uid_learner():
+    """返回全局缓存的 UidLearner；不可用时退化为空实现（不影响主流程）"""
+    global _UID_LEARNER_CACHE
+    if _UID_LEARNER_CACHE is None:
+        try:
+            from workflow.uid_learner import UidLearner
+            _UID_LEARNER_CACHE = UidLearner.load_default()
+        except Exception:
+            class _NoopLearner:
+                def suggest(self, path):
+                    return "", ""
+            _UID_LEARNER_CACHE = _NoopLearner()
+    return _UID_LEARNER_CACHE
+
 class PatternMatcher:
     """番号提取与匹配器"""
 
@@ -201,6 +220,35 @@ class PatternMatcher:
 
         return None
 
+    def extract_code_smart(self, text: str) -> Optional[Dict]:
+        """深度学习增强的番号提取
+
+        优先查询人工修正记忆（UidLearner）：
+          - 命中"同名精确记忆"或"归纳出的垃圾前后缀剥离"时，直接返回已学会的番号；
+          - 否则回退到常规 extract_code 规则。
+        返回结构与 extract_code 一致，并附带 'learned': True 标记，便于上层判断。
+        """
+        try:
+            uid, source = _get_uid_learner().suggest(text)
+        except Exception:
+            uid, source = "", ""
+        if uid:
+            letters = ''.join(re.findall(r'[A-Za-z]+', uid))
+            numbers = ''.join(re.findall(r'\d+', uid))
+            full = (letters + numbers).lower()
+            return {
+                'full': full,
+                'original': uid,
+                'canonical': uid,
+                'letters': letters.lower(),
+                'numbers': numbers,
+                'type': 'learned',
+                'is_short_numeric': False,
+                'learned': True,
+                'learned_source': source,
+            }
+        return self.extract_code(text)
+
     def normalize_number(self, number: str, target_length: int = 3) -> str:
         """规范化数字，处理前导零"""
         stripped = number.lstrip('0')
@@ -308,6 +356,7 @@ class PatternMatcher:
         - 仅中文字幕: 番号-C.mp4
         - 无码+中文字幕: 番号-UC.mp4 或 番号-UNC.mp4
         - 其他无码标记: 番号-Uncensored.mp4
+        - 无码基础上再附字幕: 番号-Uncensored-C.mp4
         - 无后缀: 番号.mp4
 
         Args:
@@ -326,14 +375,20 @@ class PatternMatcher:
         suffixes = self.detect_all_suffixes(original_filename)
 
         # 构建后缀部分
-        # 优先级：如果已有 -UC 或 -UNC，不再添加 -C（因为C已包含中文字幕含义）
+        # 优先级说明：
+        # - -UC / -UNC 本身已包含中文字幕含义，不再附加 -C
+        # - -Uncensored 基础上再附加中文字幕（如 -Uncensored-C）时，两者都保留
+        #   例如：H800@ABW-289-Uncensored-C.mp4 -> ABW-289-Uncensored-C.mp4
         suffix_part = ''
-        if suffixes['uncensored']:
-            # -UC 或 -UNC 已包含中文字幕含义
-            suffix_part += suffixes['uncensored']
-        elif suffixes['chinese_subtitle']:
+        uncensored = suffixes['uncensored']
+        chinese = suffixes['chinese_subtitle']
+        if uncensored:
+            suffix_part += uncensored
+            if chinese and uncensored not in ('-UC', '-UNC'):
+                suffix_part += chinese
+        elif chinese:
             # 仅中文字幕
-            suffix_part += suffixes['chinese_subtitle']
+            suffix_part += chinese
 
         # 多文件时添加序号
         if total_in_group > 1:

@@ -1,6 +1,6 @@
 {
   "video_grid": {
-    "root_dir": "Z:\\下载\\202605\\已下载",
+    "root_dir": "X:\\无码\\国产\\【LK大神kinyuyasan8】",
     "include_subdirs": true,
     "overwrite_existing": true,
     "grid_x": 4,
@@ -24,7 +24,7 @@
     ]
   },
   "file_organize": {
-    "source_dir": "Z:/下载/202607",
+    "source_dir": "Y:\\Other\\个人专属\\f鳳みゆ(凤美优)+川北メイサ(川北明沙)",
     "include_subfolders": true,
     "rename_video": true,
     "rename_subtitle": true,
@@ -54,8 +54,8 @@
     ]
   },
   "move_videos": {
-    "video_folder": "Z:\\下载\\202607\\已下载",
-    "target_folder": "Z:\\下载\\202607\\",
+    "video_folder": "Z:\\下载\\202608\\0已下载",
+    "target_folder": "Z:\\下载\\202608\\",
     "include_subfolders": true
   },
   "file_compare": {
@@ -71,7 +71,7 @@
   "web_grab": {
     "max_images": 0,
     "auto_download": false,
-    "save_path": "Z:\\下载\\202610\\系列\\g港区女子",
+    "save_path": "Z:\\下载\\202610\\m‌美咲そのか(美咲园香)",
     "main_image_selector": "div.movie a.bigImage",
     "sample_image_selector": "div#sample-waterfall",
     "sample_link_selector": "a.sample-box",
@@ -81,16 +81,16 @@
     "magnet_ajax_path": "/ajax/uncledatoolsbyajax.php",
     "magnet_ajax_params": "gid={gid}&lang={lang}&img={img}&uc={uc}&floor={floor}",
     "save_path_history": [
-      "Z:\\下载\\202610\\系列\\g港区女子",
-      "Z:\\下载\\202610\\c彩月七緒",
-      "Z:\\下载\\202610\\j結城りの(结城莉乃)",
-      "Z:\\下载\\202610\\c春日々音(春日音)",
-      "Z:\\下载\\202610\\s三佳詩",
-      "Z:\\下载\\202610\\b白間兎花",
-      "Z:\\下载\\202610\\系列\\y一流ホテルウーマン上品おま○こ激ピストン中出しレ×プ乱交映像(一流酒店女员工高雅小穴激烈抽插中出强×暴乱交视频)",
-      "Z:\\下载\\202610\\系列\\tラグジュTV(豪华电视)",
-      "Z:\\下载\\202610\\b百田光希",
-      "Z:\\下载\\202610\\t天宮花南"
+      "Z:\\下载\\202610\\m‌美咲そのか(美咲园香)",
+      "Z:\\下载\\202610\\l瀧本雫葉",
+      "Z:\\下载\\202610\\m蜜このは(蜜木叶)",
+      "Z:\\下载\\202610\\d渡部ほの(渡部穗乃)",
+      "Z:\\下载\\202610\\j九野ひなの(九野雏乃)",
+      "Z:\\下载\\202610\\b白岩冬萌",
+      "Z:\\下载\\202610\\y羽田カイラ",
+      "Z:\\下载\\202610\\c春原未来",
+      "Z:\\下载\\202610\\yさつき芽衣(沙月芽衣)",
+      "Z:\\下载\\202610\\系列\\z製作商：NPJ"
     ],
     "field_rules": [
       {
@@ -209,8 +209,8 @@
     "list_auto_collect": true,
     "list_render_js": false,
     "list_config_version": 3,
-    "list_last_url": "https://www.javbus.casa/genre/e/3",
-    "list_last_page": 3,
+    "list_last_url": "https://www.busfan.cyou/page/162",
+    "list_last_page": 162,
     "list_tabs": [
       {
         "name": "全部列表",
@@ -224,26 +224,32 @@
       },
       {
         "name": "類別-巨乳",
-        "url": "https://www.javbus.casa/genre/e/3",
-        "page": 3
+        "url": "https://www.busfan.cyou/genre/e/9",
+        "page": 9
+      },
+      {
+        "name": "演员-美咲そのか",
+        "url": "https://www.busfan.cyou/star/13dy",
+        "page": 1
       }
     ],
-    "list_active_tab": 2,
+    "list_active_tab": 0,
     "list_search_path": "/search/{keyword}",
     "list_active_host": "https://www.busfan.cyou",
     "list_pages_shown": "1",
     "list_wildcard_pad": "",
     "local_folder_scopes": {
       "X:\\系列": "series"
-    }
+    },
+    "list_cache_max_mb": 100
   },
   "folder_check": {
-    "check_folder": "Z:/下载/202607",
-    "check_include_subfolders": false,
+    "check_folder": "Z:\\下载\\202608\\",
+    "check_include_subfolders": true,
     "check_check_subtitle": false,
     "check_excluded_folders": [
-      "Z:\\下载\\202607\\0新下载",
-      "Z:\\下载\\202607\\已下载"
+      "Z:\\下载\\202608\\0新下载",
+      "Z:\\下载\\202608\\0已下载"
     ],
     "compare_source_folder": "F:\\other\\changeDODE\\no\\20260801",
     "compare_target_folder": "F:\\other\\changeDODE\\OK",
@@ -257,21 +263,22 @@
     "compare_target_history": [
       "F:\\other\\changeDODE\\OK",
       "Z:/下载/202608/0已下载"
-    ]
+    ],
+    "vlc_path": "D:\\Program Files\\VideoLAN\\VLC\\vlc.exe"
   },
   "video_transcode": {
-    "save_mode": "custom",
+    "save_mode": "source",
     "save_dir": "F:/other/changeDODE/OK",
     "resolution": "1280x720",
     "orientation": "横向",
     "aspect": "保持原比例",
-    "bitrate": 2500,
+    "bitrate": 1000,
     "concurrency": 3,
-    "after_done": "睡眠",
+    "after_done": "无操作",
     "precision": "0.1S",
     "ffmpeg_path": "C:\\Program Files\\ffmpeg\\bin\\ffmpeg.EXE",
     "encoder": "auto",
-    "subtitle": "软字幕·封装（随转码）",
+    "subtitle": "不添加字幕",
     "del_src": false,
     "del_srt": false,
     "overwrite_src": false
@@ -288,5 +295,81 @@
         "console": true
       }
     ]
+  },
+  "workflow_tab": {
+    "recursive": true,
+    "only_video": true,
+    "job": {
+      "name": "默认流程",
+      "source_dir": "",
+      "recursive": true,
+      "only_video": true,
+      "steps": [
+        {
+          "type": "subtitle",
+          "enabled": false,
+          "params": {
+            "asr_engine": "kotoba-whisper",
+            "model_size": "medium",
+            "translator_engine": "Sakura-GalTransl-7B",
+            "device": "cuda",
+            "compute_type": "int8",
+            "bilingual": false,
+            "skip_existing": true
+          }
+        },
+        {
+          "type": "transcode",
+          "enabled": true,
+          "params": {
+            "trim_mode": "none",
+            "start": 0.0,
+            "end": 0.0,
+            "head": 0.0,
+            "tail": 0.0,
+            "resolution": "保持原分辨率",
+            "aspect": "保持原比例",
+            "bitrate": 1500,
+            "encoder": "自动（优先显卡加速）",
+            "save_mode": "custom",
+            "save_dir": "F:\\other\\changeDODE\\OK",
+            "out_ext": "mp4",
+            "keep_quality": true,
+            "keep_bitrate": true,
+            "tc_merge": false,
+            "auto_orient": true,
+            "portrait_res": "自动(按源比例)",
+            "subtitle_mode": "none",
+            "del_src": false,
+            "del_srt": true
+          }
+        },
+        {
+          "type": "move",
+          "enabled": false,
+          "params": {
+            "target_dir": "Y:\\Other\\个人专属\\g高梨真緒",
+            "with_companions": true,
+            "companion_exts": ".srt,.ass,.ssa,.jpg,.jpeg,.png,.webp,.nfo,.json",
+            "uid_subdir": false
+          }
+        },
+        {
+          "type": "rename",
+          "enabled": false,
+          "params": {
+            "name_template": "黑帝斯Hades-最新约战女神艾熙-2",
+            "with_companions": true,
+            "companion_exts": ".srt,.ass,.ssa,.jpg,.jpeg,.png,.webp,.nfo,.json"
+          }
+        }
+      ],
+      "finish_action": "none",
+      "continue_on_error": false
+    },
+    "finish_action": "none",
+    "continue_on_error": false,
+    "parallel_threads": 1,
+    "tasks": []
   }
 }

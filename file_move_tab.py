@@ -35,7 +35,8 @@ import json
 import time
 import threading
 from pathlib import Path
-from typing import List, Optional
+from concurrent.futures import ThreadPoolExecutor
+from typing import List, Optional, Dict
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -53,10 +54,19 @@ except ImportError:
 VIDEO_EXTENSIONS = {'.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.ts',
                     '.rmvb', '.rm', '.m4v', '.mpg', '.mpeg', '.3gp', '.webm'}
 
+# 字幕扩展名（勾选“处理字幕文件”时，同名校验会补上这些兄弟字幕）
+SUBTITLE_EXTENSIONS = {'.srt', '.ass', '.ssa', '.sub', '.idx', '.smi', '.vtt'}
+
 CONFIG_SECTION = "file_move_tab"
 
 FINISH_NONE, FINISH_SHUTDOWN, FINISH_SLEEP = "none", "shutdown", "sleep"
 FINISH_LABELS = {"none": "无操作", "shutdown": "关机", "sleep": "进入睡眠"}
+
+# 移动时的最大并发线程数（同盘 rename 接近瞬时，主要加速跨盘复制；可按需调整）
+CONCURRENT_MOVES = 4
+
+# 任务状态持久化文件名（记录每个文件的完成状态，用于崩溃后断点续传）
+TASK_STATE_FILE = "file_move_tasks.json"
 
 
 def bs(path: str) -> str:
@@ -66,6 +76,10 @@ def bs(path: str) -> str:
 
 def is_video(name: str) -> bool:
     return os.path.splitext(name)[1].lower() in VIDEO_EXTENSIONS
+
+
+def is_subtitle(name: str) -> bool:
+    return os.path.splitext(name)[1].lower() in SUBTITLE_EXTENSIONS
 
 
 def unique_dst(dst: Path) -> Path:
@@ -91,7 +105,9 @@ class StandaloneController:
     def _load_config(self) -> dict:
         default = {CONFIG_SECTION: {
             "directory": "", "mode": "flatten", "all_subfolders": False,
-            "only_video": True, "dry_run": True,
+            "only_video": True, "proc_sub": False, "proc_other": False,
+            "rename_folder": False,
+            "dry_run": True,
             "folder_b": "", "finish_action": FINISH_NONE, "folder_whole": True,
             "folder_b_history": [],
         }}
@@ -155,6 +171,7 @@ class FileMoveTab:
         self.frame = ttk.Frame(parent)
         self._build_ui(self.frame)
         self._load_config()
+        self._restore_tasks()      # 启动恢复：载入上次未完成（含崩溃中断）的任务
 
     # ============================ 界面构建 ============================
     def _build_ui(self, parent):
@@ -201,15 +218,31 @@ class FileMoveTab:
         ttk.Radiobutton(row, text="b. 视频移入同名子文件夹", variable=self.mode_var,
                         value="vsub").pack(side=tk.LEFT, padx=4)
 
-        # 选项
+        # 选项：子文件夹范围 + 以文件夹名改名
         row = ttk.Frame(f)
         row.pack(fill=tk.X, padx=8, pady=2)
-        self.all_sub_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(row, text="包含所有子文件夹（递归）",
-                        variable=self.all_sub_var).pack(side=tk.LEFT, padx=4)
-        self.only_video_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(row, text="仅处理视频文件",
-                        variable=self.only_video_var).pack(side=tk.LEFT, padx=4)
+        ttk.Label(row, text="子文件夹范围:").pack(side=tk.LEFT, padx=(0, 4))
+        self.sub_scope_var = tk.StringVar(value="sub")
+        ttk.Radiobutton(row, text="次级子文件夹", variable=self.sub_scope_var,
+                        value="sub").pack(side=tk.LEFT, padx=4)
+        ttk.Radiobutton(row, text="递归所有级", variable=self.sub_scope_var,
+                        value="all").pack(side=tk.LEFT, padx=4)
+        self.rename_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row, text="以文件夹名改名",
+                        variable=self.rename_var).pack(side=tk.LEFT, padx=4)
+
+        # 选项：要处理的文件类型
+        row = ttk.Frame(f)
+        row.pack(fill=tk.X, padx=8, pady=(0, 2))
+        self.proc_video_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(row, text="处理视频文件",
+                        variable=self.proc_video_var).pack(side=tk.LEFT, padx=4)
+        self.proc_sub_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row, text="处理字幕文件",
+                        variable=self.proc_sub_var).pack(side=tk.LEFT, padx=4)
+        self.proc_other_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row, text="其它所有文件",
+                        variable=self.proc_other_var).pack(side=tk.LEFT, padx=4)
         self.dry_run_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(row, text="仅演示（不实际移动）",
                         variable=self.dry_run_var).pack(side=tk.LEFT, padx=4)
@@ -233,14 +266,16 @@ class FileMoveTab:
         f = ttk.LabelFrame(parent, text="二、文件移动到目标文件夹（支持拖放 / 任务队列）")
         f.pack(fill=tk.X, padx=10, pady=6)
 
-        # 目标文件夹（点击输入框弹出历史路径选择层）
+        # 目标文件夹（右侧“▼”按钮弹出历史路径选择层；输入框保持可自由输入/粘贴）
         row = ttk.Frame(f)
         row.pack(fill=tk.X, padx=8, pady=4)
         ttk.Label(row, text="目标文件夹:").pack(side=tk.LEFT, padx=(0, 5))
         self.b_dir_var = tk.StringVar()
         self.b_dir_entry = ttk.Entry(row, textvariable=self.b_dir_var)
         self.b_dir_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
-        self.b_dir_entry.bind('<Button-1>', lambda e: self._show_folder_history())
+        self.b_hist_btn = ttk.Button(row, text="▼", width=3,
+                                     command=self._show_folder_history)
+        self.b_hist_btn.pack(side=tk.LEFT, padx=(0, 2))
         ttk.Button(row, text="浏览...", command=self._browse_b).pack(side=tk.LEFT, padx=2)
 
         # 文件列表（拖放目标，四列显示，点击表头排序）
@@ -398,7 +433,7 @@ class FileMoveTab:
         self._folder_b_history = hist[:6]
 
     def _show_folder_history(self):
-        """点击目标文件夹输入框时弹出历史路径选择层（下拉菜单样式），
+        """点击“▼”按钮弹出历史路径下拉菜单（与“演员 ▼”同款样式），
         选择后即可切换；没有历史时不弹出"""
         hist = list(getattr(self, '_folder_b_history', []) or [])
         if not hist:
@@ -410,18 +445,18 @@ class FileMoveTab:
             menu.add_command(label=path,
                              command=lambda p=path: self._pick_folder_history(p))
 
-        entry = getattr(self, 'b_dir_entry', None)
+        btn = getattr(self, 'b_hist_btn', None)
         try:
             menu.update_idletasks()
             h = menu.winfo_reqheight()
         except Exception:
             h = 0
         try:
-            if entry is not None and entry.winfo_exists():
-                pos_x = entry.winfo_rootx()
-                pos_y = entry.winfo_rooty() + entry.winfo_height()   # 弹在输入框下方
-                if pos_y + h > root.winfo_screenheight():            # 下方放不下则弹在上方
-                    pos_y = max(0, entry.winfo_rooty() - h)
+            if btn is not None and btn.winfo_exists():
+                pos_x = btn.winfo_rootx()
+                pos_y = btn.winfo_rooty() + btn.winfo_height()   # 默认弹在按钮下方
+                if pos_y + h > root.winfo_screenheight():        # 下方放不下则弹在上方
+                    pos_y = max(0, btn.winfo_rooty() - h)
             else:
                 pos_x = self.frame.winfo_rootx() + 60
                 pos_y = self.frame.winfo_rooty() + 100
@@ -436,9 +471,10 @@ class FileMoveTab:
                 pass
 
     def _pick_folder_history(self, path: str):
-        """选中历史路径：填入输入框并置顶历史"""
+        """选中历史路径：填入输入框、置顶历史并落盘"""
         self._remember_folder_b(path)
         self.b_dir_var.set(path)
+        self._persist_config()
         self._log(f"[目标文件夹] 已切换为历史路径：{path}")
 
     # ============================ 区块一：文件夹整理 ============================
@@ -461,24 +497,34 @@ class FileMoveTab:
 
     def _run_a(self, root: str):
         root = Path(root)
-        only_video = self.only_video_var.get()
         dry = self.dry_run_var.get()
         mode = self.mode_var.get()
+        proc_video = self.proc_video_var.get()
+        proc_sub = self.proc_sub_var.get()
+        proc_other = self.proc_other_var.get()
         moved = errors = 0
 
         # 收集待处理文件（源文件 -> 目标文件夹）
         if mode == "flatten":
-            recursive = self.all_sub_var.get()
-            srcs = self._collect_flatten(root, recursive, only_video)
-            tasks = [(p, root) for p in srcs]
+            recursive = (self.sub_scope_var.get() == "all")
+            srcs = self._collect_flatten(root, recursive)
+            rename = self.rename_var.get()
+            tasks = []
+            for p in srcs:
+                # 勾选“以文件夹名改名”时，移出的文件以其原所在文件夹名重命名（保留原扩展名）
+                new_name = f"{p.parent.name}{p.suffix}" if rename else p.name
+                tasks.append((p, root, new_name))
             self._log(f"\n=== 模式a：子文件夹文件上移到 {bs(str(root))} ===")
-            self._log(f"包含所有子文件夹: {'是' if recursive else '否（仅子级 1 层）'}"
-                      f"  仅视频: {only_video}  {'[演示]' if dry else '[执行]'}")
+            self._log(f"子文件夹范围: {'递归所有级' if recursive else '仅次级'}"
+                      f"  处理视频: {proc_video}  处理字幕: {proc_sub}"
+                      f"  其它所有: {proc_other}  以文件夹名改名: {rename}"
+                      f"  {'[演示]' if dry else '[执行]'}")
         else:
-            tasks = [(p, root / p.stem) for p in root.iterdir()
-                     if p.is_file() and (not only_video or is_video(p.name))]
+            tasks = [(p, root / p.stem, p.name) for p in root.iterdir()
+                     if p.is_file() and self._accept_file(p.name)]
             self._log(f"\n=== 模式b：视频移入同名子文件夹 ===")
-            self._log(f"目录: {bs(str(root))}  仅视频: {only_video}  {'[演示]' if dry else '[执行]'}")
+            self._log(f"目录: {bs(str(root))}  处理视频: {proc_video}  处理字幕: {proc_sub}"
+                      f"  其它所有: {proc_other}  {'[演示]' if dry else '[执行]'}")
 
         total = len(tasks)
         self._log(f"待处理文件: {total}")
@@ -486,7 +532,7 @@ class FileMoveTab:
             self._ui(self._a_finish, 0, 0)
             return
 
-        for i, (src, dst_dir) in enumerate(tasks, 1):
+        for i, (src, dst_dir, new_name) in enumerate(tasks, 1):
             if self._stop:
                 self._log("操作被停止")
                 break
@@ -494,7 +540,7 @@ class FileMoveTab:
                 if mode == "vsub" and not dst_dir.exists():
                     if not dry:
                         dst_dir.mkdir(parents=True, exist_ok=True)
-                target = unique_dst(dst_dir / src.name)
+                target = unique_dst(dst_dir / new_name)
                 self._log(f"{'[演示] ' if dry else '[移动] '}{bs(str(src))} -> {bs(str(target))}")
                 if not dry:
                     shutil.move(str(src), str(target))
@@ -506,17 +552,49 @@ class FileMoveTab:
 
         self._ui(self._a_finish, moved, errors)
 
-    @staticmethod
-    def _collect_flatten(root: Path, recursive: bool, only_video: bool) -> List[Path]:
+    def _accept_file(self, name: str) -> bool:
+        """区块一筛选：是否处理该文件。
+        “处理视频文件”“处理字幕文件”“其它所有文件”三个勾选项
+        分别独立控制视频、字幕、其余类型文件是否处理。"""
+        if is_video(name):
+            return self.proc_video_var.get()
+        if is_subtitle(name):
+            return self.proc_sub_var.get()
+        # 视频与字幕以外的其它所有文件
+        return self.proc_other_var.get()
+
+    def _expand_with_subtitles(self, files) -> List[str]:
+        """区块二（A→B 选择性移动）：若勾选“处理字幕文件”，为每个视频文件
+        补上同目录、同名的字幕文件（若存在且未在清单中），使视频与字幕一起移动。
+        文件夹项（整体移动）内部的字幕会随文件夹一起移动，无需单独配对。"""
+        files = [bs(str(f)) for f in files]
+        if not self.proc_sub_var.get():
+            return files
+        out: List[str] = []
+        seen = set()
+        for f in files:
+            if f.lower() not in seen:
+                seen.add(f.lower())
+                out.append(f)
+            if os.path.isfile(f) and is_video(os.path.basename(f)):
+                base = os.path.splitext(f)[0]
+                for ext in SUBTITLE_EXTENSIONS:
+                    sib = base + ext
+                    if os.path.isfile(sib) and sib.lower() not in seen:
+                        seen.add(sib.lower())
+                        out.append(sib)
+        return out
+
+    def _collect_flatten(self, root: Path, recursive: bool) -> List[Path]:
         """收集需上移的文件：
         - 默认仅“子级”文件夹（1 层）里的文件；
         - recursive=True 时遍历所有子文件夹（不含根目录本身的文件）。
+        是否处理视频/字幕由 _accept_file 依据勾选项决定。
         """
         files: List[Path] = []
         if recursive:
             for p in root.rglob('*'):
-                if p.is_file() and p.parent != root \
-                        and (not only_video or is_video(p.name)):
+                if p.is_file() and p.parent != root and self._accept_file(p.name):
                     files.append(p)
         else:
             try:
@@ -526,7 +604,7 @@ class FileMoveTab:
             for sub in subs:
                 try:
                     for f in sub.iterdir():
-                        if f.is_file() and (not only_video or is_video(f.name)):
+                        if f.is_file() and self._accept_file(f.name):
                             files.append(f)
                 except (PermissionError, OSError):
                     continue
@@ -719,17 +797,27 @@ class FileMoveTab:
         return f"{n} B"
 
     # ---------- 任务管理 ----------
+    # 任务数据结构：{id, files:[源路径...], target, status, done_map:{源路径:True}}
+    #   done_map 记录“已成功移动”的源项（文件或文件夹），用于断点续传与崩溃恢复
+    def _task_total(self, task: dict) -> int:
+        return len(task.get("files", []))
+
+    def _task_done(self, task: dict) -> int:
+        return len(task.get("done_map", {}))
+
     def _new_task(self, files, target: str) -> dict:
         self._task_seq += 1
         task = {"id": self._task_seq, "files": list(files), "target": bs(target),
-                "done": 0, "status": "等待中"}
+                "status": "等待中", "done_map": {}}
         self._tasks.append(task)
         self._refresh_task_tree()
+        self._save_tasks()
         return task
 
     def _create_task(self):
         """把当前文件清单 + 目标文件夹记录为一个任务，之后可继续设置下一个任务"""
         files = [r["path"] for r in self._b_rows]
+        files = self._expand_with_subtitles(files)
         target = self.b_dir_var.get().strip()
         if not files:
             messagebox.showwarning("警告", "请先把要移动的文件/文件夹拖入文件列表（或用“添加文件”“添加文件夹”）")
@@ -739,6 +827,7 @@ class FileMoveTab:
             return
         task = self._new_task(files, target)
         self._remember_folder_b(target)   # 以该路径创建过任务，记入历史
+        self._persist_config()            # 立即落盘，软件关闭后历史仍在
         self._log(f"[任务] 已创建 #{task['id']}：{len(files)} 项 -> {bs(target)}")
         self.b_status.configure(text=f"已创建任务 #{task['id']}，可继续添加下一个任务")
         self._b_clear_files()   # 清空清单，便于继续设置下一个任务
@@ -746,6 +835,7 @@ class FileMoveTab:
     def _start_b(self):
         """立即移动：把当前清单作为一个任务并马上开始执行"""
         files = [r["path"] for r in self._b_rows]
+        files = self._expand_with_subtitles(files)
         target = self.b_dir_var.get().strip()
         if not files:
             messagebox.showwarning("警告", "请先把要移动的文件/文件夹拖入文件列表（或用“添加文件”“添加文件夹”）")
@@ -757,6 +847,7 @@ class FileMoveTab:
             return
         task = self._new_task(files, target)
         self._remember_folder_b(target)   # 以该路径创建过任务，记入历史
+        self._persist_config()            # 立即落盘，软件关闭后历史仍在
         self._b_clear_files()
         self._run_queue([task["id"]])
 
@@ -783,6 +874,7 @@ class FileMoveTab:
             return
         self._tasks = [t for t in self._tasks if t["id"] not in ids]
         self._refresh_task_tree()
+        self._save_tasks()
 
     def _clear_tasks(self):
         if self._running:
@@ -790,15 +882,79 @@ class FileMoveTab:
             return
         self._tasks = []
         self._refresh_task_tree()
+        self._save_tasks()
 
     def _refresh_task_tree(self):
         self.task_tree.delete(*self.task_tree.get_children())
         for t in self._tasks:
+            done, total = self._task_done(t), self._task_total(t)
             self.task_tree.insert("", tk.END, iid=str(t["id"]), values=(
-                f"#{t['id']}", f"{t['done']}/{len(t['files'])}", t["target"], t["status"]))
+                f"#{t['id']}", f"{done}/{total}", t["target"], t["status"]))
+
+    # ---------- 任务状态持久化与崩溃恢复 ----------
+    def _state_path(self) -> str:
+        """任务状态文件：与主配置同目录（优先用控制器配置路径，否则本文件目录）"""
+        base = os.path.dirname(os.path.abspath(__file__))
+        try:
+            cp = get_config_path() if 'get_config_path' in globals() else None
+            if cp:
+                base = os.path.dirname(os.path.abspath(cp))
+        except Exception:
+            pass
+        return os.path.join(base, TASK_STATE_FILE)
+
+    def _save_tasks(self):
+        """把任务（含每个文件的完成状态）落盘，供崩溃后断点续传"""
+        try:
+            data = {"tasks": []}
+            for t in self._tasks:
+                data["tasks"].append({
+                    "id": t["id"], "files": t["files"], "target": t["target"],
+                    "status": t.get("status", "等待中"),
+                    "done_map": list(t.get("done_map", {}).keys()),
+                })
+            with open(self._state_path(), 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False)
+        except Exception as e:
+            self._log(f"[警告] 任务状态保存失败（不影响本次移动）: {e}")
+
+    def _restore_tasks(self):
+        """启动恢复：载入上次未完成的任务（含崩溃中断），重建任务清单与进度。
+        已完成的项在 done_map 中会被自动跳过，未完成的项保留源路径等待继续。"""
+        try:
+            path = self._state_path()
+            if not os.path.exists(path):
+                return
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            tasks = data.get("tasks", [])
+            if not tasks:
+                return
+            restored = 0
+            for t in tasks:
+                files = [bs(p) for p in t.get("files", []) if str(p).strip()]
+                if not files:
+                    continue
+                self._task_seq = max(self._task_seq, int(t.get("id", 0)))
+                done_set = {bs(p) for p in t.get("done_map", [])}
+                status = t.get("status", "等待中")
+                # 崩溃时处于“进行中/已停止”的任务标记为可继续
+                if status in ("进行中", "已停止"):
+                    status = "可继续"
+                task = {"id": t["id"], "files": files, "target": bs(t.get("target", "")),
+                        "status": status,
+                        "done_map": {p: True for p in done_set if p in set(files)}}
+                self._tasks.append(task)
+                restored += 1
+            if restored:
+                self._refresh_task_tree()
+                self._log(f"[恢复] 已载入上次 {restored} 个任务（含未完成），"
+                          f"可在任务清单中点击“执行选中/执行全部”继续移动")
+        except Exception as e:
+            self._log(f"[警告] 任务状态恢复失败: {e}")
 
     def _run_queue(self, task_ids):
-        """按顺序逐个执行任务（A 完成再执行 B...）"""
+        """按任务顺序逐个执行（A 完成再执行 B...），每个任务内多文件并发移动"""
         if self._running:
             messagebox.showwarning("警告", "已有任务正在执行，请先停止或等待完成")
             return
@@ -810,13 +966,18 @@ class FileMoveTab:
             target=self._worker, args=(list(task_ids),), daemon=True)
         self._task_thread.start()
 
+    # ---------- 移动执行（多线程并发 + 安全移动 + 断点续传） ----------
     def _worker(self, task_ids):
+        """按任务顺序逐个执行；每个任务内把待移动项拆分为多份，用线程池并发移动。
+        每完成一项即写入 done_map 并持久化，因此暂停/停止或程序崩溃后再次打开，
+        未完成的项会被自动跳过已完成的、继续移动剩余项。
+        """
         tasks = [t for t in self._tasks if t["id"] in set(task_ids)]
         for task in tasks:
             if self._stop:
                 break
             self._cur_task = task
-            total = len(task["files"])
+            total = self._task_total(task)
             task["status"] = "进行中"
             self._ui(self._refresh_task_tree)
             self._log(f"\n=== 开始任务 #{task['id']}：{total} 项 -> {task['target']} ===")
@@ -831,48 +992,181 @@ class FileMoveTab:
                     self._ui(self._refresh_task_tree)
                     continue
 
-            while task["done"] < total:
-                if self._stop:
-                    break
-                # 暂停：停在当前文件之前，恢复后从下一个文件继续（断点续传）
-                while not self._pause.is_set():
+            lock = threading.Lock()
+            sem = threading.Semaphore(CONCURRENT_MOVES)
+            pending = [p for p in task["files"]
+                       if p not in task.setdefault("done_map", {})]
+
+            def _on_done(_fut):
+                sem.release()
+
+            with ThreadPoolExecutor(max_workers=CONCURRENT_MOVES) as ex:
+                futures = []
+                for src in pending:
                     if self._stop:
                         break
-                    self._pause.wait(timeout=0.2)
-                if self._stop:
-                    break
+                    # 暂停：等待恢复后再提交新项（已提交的可继续跑完）
+                    while not self._pause.is_set():
+                        if self._stop:
+                            break
+                        self._pause.wait(timeout=0.2)
+                    if self._stop:
+                        break
+                    sem.acquire()
+                    fut = ex.submit(self._move_item, task, src, str(tgt), lock)
+                    fut.add_done_callback(_on_done)
+                    futures.append(fut)
+                for fut in futures:
+                    try:
+                        fut.result()
+                    except Exception:
+                        pass
 
-                src = Path(task["files"][task["done"]])
-                name = src.name
-                if not src.exists():
-                    self._log(f"[跳过] 源不存在: {bs(str(src))}")
-                    task["done"] += 1
-                    continue
-                is_dir = src.is_dir()
-                target = unique_dst(tgt / name)
-                try:
-                    tag = "[移动文件夹]" if is_dir else "[移动]"
-                    self._log(f"{tag} {bs(str(src))} -> {bs(str(target))}")
-                    shutil.move(str(src), str(target))
-                except Exception as e:
-                    self._log(f"移动失败 {name}: {e}")
-                task["done"] += 1
-                self._ui(self._b_progress, int(task["done"] / total * 100),
-                         f"任务#{task['id']} [{task['done']}/{total}] "
-                         f"{'[目录] ' if is_dir else ''}{name}")
-                self._ui(self._refresh_task_tree)
-
+            done = self._task_done(task)
             if self._stop:
-                task["status"] = f"已停止（{task['done']}/{total}）"
-                self._log(f"任务 #{task['id']} 已停止：已移动 {task['done']}/{total}，"
-                          f"已移动的文件保留在目标文件夹")
+                task["status"] = f"已停止（{done}/{total}）"
+                self._log(f"任务 #{task['id']} 已停止：已移动 {done}/{total}，"
+                          f"未移动项保留在源路径，可稍后继续")
             else:
-                task["status"] = "已完成"
-                self._log(f"任务 #{task['id']} 完成：共移动 {total} 项")
+                task["status"] = "已完成" if done == total else "部分完成"
+                self._log(f"任务 #{task['id']} 结束：已移动 {done}/{total} 项")
+            self._save_tasks()
 
         self._cur_task = None
         self._ui(self._refresh_task_tree)
         self._ui(self._b_finish, not self._stop)
+
+        # 全部执行完毕（非停止）且本批任务均已成功完成时，自动清空任务清单
+        if not self._stop:
+            run_set = set(task_ids)
+            finished = [t for t in self._tasks
+                        if t["id"] in run_set
+                        and self._task_done(t) == self._task_total(t)]
+            if finished:
+                self._tasks = [t for t in self._tasks if t not in finished]
+                self._save_tasks()   # 同步落盘，重启后不再恢复已清空的清单
+                self._ui(self._refresh_task_tree)
+                if not self._tasks:
+                    self._log("[任务] 全部任务完成，已自动清空任务清单")
+                else:
+                    self._log(f"[任务] 已自动移除 {len(finished)} 个已完成任务，"
+                              f"剩余 {len(self._tasks)} 个未完成/未执行")
+
+    def _move_item(self, task: dict, src: str, tgt: str, lock: threading.Lock) -> bool:
+        """移动单条源项（文件或文件夹），成功后写入 done_map 并持久化/更新进度。"""
+        src = bs(src)
+        if not os.path.exists(src):
+            self._log(f"[跳过] 源不存在: {bs(src)}")
+            with lock:
+                task.setdefault("done_map", {})[src] = True   # 不存在也标记，避免反复重试
+                self._persist_progress(task)
+            return True
+        name = os.path.basename(os.path.normpath(src.rstrip('/\\'))) or src
+        try:
+            if os.path.isdir(src):
+                self._merge_move_folder(src, tgt)
+                self._log(f"[移动文件夹] {bs(src)} -> 合并到 {bs(os.path.join(tgt, name))}")
+            else:
+                dest = self._safe_move_file(src, tgt)
+                self._log(f"[移动] {bs(src)} -> {bs(dest)}")
+        except Exception as e:
+            self._log(f"移动失败 {name}: {e}")
+            return False
+        with lock:
+            task.setdefault("done_map", {})[src] = True
+            self._persist_progress(task)
+        return True
+
+    def _persist_progress(self, task: dict):
+        """更新进度条/列表并把任务状态落盘（断点续传依据）"""
+        done = self._task_done(task)
+        total = self._task_total(task)
+        self._ui(self._b_progress, int(done / total * 100),
+                 f"任务#{task['id']} [{done}/{total}]")
+        self._ui(self._refresh_task_tree)
+        self._save_tasks()
+
+    def _safe_move_file(self, src: str, dst_parent: str) -> str:
+        """安全移动单个文件，杜绝中断导致的文件损坏：
+        - 同盘：os.rename 原子操作，不会产生半截文件；
+        - 跨盘：先复制为 .part，校验大小一致后原子替换目标，再删源；
+          中途崩溃则残留 .part 会在下次重试时清理，绝不覆盖/损坏目标。
+        目标重名时加数字后缀，不覆盖已有文件。
+        """
+        name = os.path.basename(os.path.normpath(src.rstrip('/\\'))) or src
+        dst = os.path.join(dst_parent, name)
+        if os.path.exists(dst):
+            dst = str(unique_dst(Path(dst)))
+        # 同盘：直接原子 rename（最快、最安全）
+        try:
+            st_src = os.stat(src)
+            st_parent = os.stat(dst_parent)
+            if st_src.st_dev == st_parent.st_dev:
+                shutil.move(src, dst)
+                return dst
+        except OSError:
+            pass
+        # 跨盘：.part 拷贝 -> 校验 -> 原子替换 -> 删源
+        part = dst + ".part"
+        try:
+            if os.path.exists(part):
+                os.remove(part)
+            shutil.copy2(src, part)
+            if os.path.getsize(part) != os.path.getsize(src):
+                raise IOError("拷贝大小不一致，可能已损坏")
+            os.replace(part, dst)        # 目标所在盘内原子替换
+            os.remove(src)
+        except Exception:
+            try:
+                if os.path.exists(part):
+                    os.remove(part)
+            except OSError:
+                pass
+            raise
+        return dst
+
+    def _merge_move_folder(self, src_dir: str, dst_parent: str):
+        """把源文件夹整体移入 dst_parent：若目标已存在同名文件夹，则合并其内部文件
+        （递归）；仅当同名文件/子项冲突时才给新项加数字后缀，绝不覆盖已有内容。
+        文件移动走 _safe_move_file，跨盘中断也不会损坏。
+        """
+        name = os.path.basename(os.path.normpath(src_dir.rstrip('/\\'))) or src_dir
+        dst_dir = os.path.join(dst_parent, name)
+        if not os.path.isdir(dst_dir):
+            # 目标无同名文件夹：创建后逐文件安全移入（跨盘也安全，便于断点续传）
+            if os.path.exists(dst_dir):
+                dst_dir = str(unique_dst(Path(dst_dir)))
+            try:
+                os.makedirs(dst_dir, exist_ok=True)
+            except OSError as e:
+                self._log(f"创建目标文件夹失败 {name}: {e}")
+                return
+        # 逐项合并（目标已存在同名文件夹则合并内部文件；否则直接移入）
+        try:
+            for entry in os.scandir(src_dir):
+                s = entry.path
+                if entry.is_dir():
+                    self._merge_move_folder(s, dst_dir)     # 递归合并子文件夹
+                else:
+                    if entry.name.endswith('.part'):        # 清理上次中断残留的临时文件
+                        try:
+                            os.remove(s)
+                        except OSError:
+                            pass
+                        continue
+                    try:
+                        self._safe_move_file(s, dst_dir)
+                    except Exception as e:
+                        self._log(f"移动失败 {entry.name}: {e}")
+        except OSError as e:
+            self._log(f"合并文件夹出错 {name}: {e}")
+        finally:
+            # 源文件夹已搬空则删除，避免残留空目录
+            try:
+                if os.path.isdir(src_dir) and not os.listdir(src_dir):
+                    os.rmdir(src_dir)
+            except OSError:
+                pass
 
     def _b_progress(self, pct: int, text: str):
         self.b_progress['value'] = pct
@@ -915,7 +1209,11 @@ class FileMoveTab:
             if action == FINISH_SHUTDOWN:
                 os.system("shutdown /s /f /t 30")
             elif action == FINISH_SLEEP:
-                os.system("rundll32.exe powrprof.dll,SetSuspendState 0,1,0")
+                from system_power import enter_sleep
+                if not enter_sleep():
+                    self._log("[完成后操作] 发起睡眠失败（可能被系统/驱动阻止）。"
+                             "可检查：①快速启动是否开启；②网卡/鼠标/键盘的“允许此设备唤醒"
+                             "计算机”；③计划任务唤醒定时器（powercfg /waketimers，需管理员）")
         except Exception as e:
             self._log(f"[完成后操作] 执行{label}失败: {e}")
 
@@ -957,8 +1255,13 @@ class FileMoveTab:
         cfg = self.tab_config
         self.dir_var.set(bs(cfg.get("directory", "")))
         self.mode_var.set(cfg.get("mode", "flatten"))
-        self.all_sub_var.set(cfg.get("all_subfolders", False))
-        self.only_video_var.set(cfg.get("only_video", True))
+        # 子文件夹范围：旧键 all_subfolders(True=递归) 兼容；新键用 sub_scope
+        self.sub_scope_var.set("all" if cfg.get("all_subfolders", False) else "sub")
+        self.rename_var.set(cfg.get("rename_folder", False))
+        # 兼容旧配置键 only_video；新键为 proc_video / proc_sub
+        self.proc_video_var.set(cfg.get("proc_video", cfg.get("only_video", True)))
+        self.proc_sub_var.set(cfg.get("proc_sub", False))
+        self.proc_other_var.set(cfg.get("proc_other", False))
         self.dry_run_var.set(cfg.get("dry_run", True))
         self.b_dir_var.set(bs(cfg.get("folder_b", "")))
         self.folder_whole_var.set(cfg.get("folder_whole", True))
@@ -970,14 +1273,16 @@ class FileMoveTab:
         except Exception:
             self._folder_b_history = []
 
-    def _save_config(self):
-        # 点“保存设置”时把当前目标文件夹记入历史（非空才记录）
-        self._remember_folder_b(self.b_dir_var.get())
+    def _persist_config(self):
+        """把当前配置（含目标文件夹历史）写入磁盘，供下次启动恢复"""
         config = {CONFIG_SECTION: {
             "directory": bs(self.dir_var.get()),
             "mode": self.mode_var.get(),
-            "all_subfolders": self.all_sub_var.get(),
-            "only_video": self.only_video_var.get(),
+            "all_subfolders": (self.sub_scope_var.get() == "all"),
+            "rename_folder": self.rename_var.get(),
+            "proc_video": self.proc_video_var.get(),
+            "proc_sub": self.proc_sub_var.get(),
+            "proc_other": self.proc_other_var.get(),
             "dry_run": self.dry_run_var.get(),
             "folder_b": bs(self.b_dir_var.get()),
             "folder_whole": self.folder_whole_var.get(),
@@ -987,11 +1292,17 @@ class FileMoveTab:
         }}
         if hasattr(self.controller, 'save_config'):
             if self.controller.save_config(config):
-                self._log("[配置] 设置已保存")
-            else:
-                self._log("[配置] 保存设置失败")
-        else:
-            self._log("[配置] 当前控制器不支持保存配置")
+                return True
+            self._log("[配置] 保存设置失败")
+            return False
+        self._log("[配置] 当前控制器不支持保存配置")
+        return False
+
+    def _save_config(self):
+        # 点“保存设置”时把当前目标文件夹记入历史（非空才记录）并落盘
+        self._remember_folder_b(self.b_dir_var.get())
+        if self._persist_config():
+            self._log("[配置] 设置已保存")
 
 
 # ============================ 独立运行入口 ============================

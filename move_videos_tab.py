@@ -191,6 +191,22 @@ class MoveVideosTab:
         self.folder_index: Dict[str, List] = {}
         self.name_index: Dict[str, List] = {}
 
+        # 目标文件夹全部子目录（用于事后统计"空文件夹"）
+        self.all_target_folders: List[Path] = []
+        # 本次操作中实际有视频移入的目标文件夹
+        self.used_target_folders: set = set()
+
+        # 源文件夹文件映射：目录 -> 该目录下所有文件（只扫描一次，避免每文件重复遍历磁盘）
+        self.source_file_map: Dict[Path, List[Path]] = {}
+
+        # 番号深度学习库（与 workflow 模块共用同一份 uid_learn.json，懒加载）
+        self.uid_learner = self._load_uid_learner()
+
+        # 事后待处理数据（供手动配对）
+        self.unmoved_videos: List[Path] = []
+        self.empty_folders: List[Path] = []
+        self._leftover_item_ids: List[str] = []
+
         # 进度队列
         self.progress_queue = queue.Queue()
         
@@ -215,6 +231,18 @@ class MoveVideosTab:
         # 启动检查器
         self.check_progress()
         self.check_ui_updates()
+
+    def _load_uid_learner(self):
+        """加载番号深度学习库（与 workflow 模块共用同一份 uid_learn.json）
+
+        加载失败则退化为 None，不影响主流程（仅失去"人工修正记忆"能力）。
+        """
+        try:
+            from workflow.uid_learner import UidLearner
+            return UidLearner.load_default()
+        except Exception as e:
+            self.log(f"[深度学习库] 加载失败，将不启用人工修正记忆: {e}")
+            return None
 
     def _create_fallback_matcher(self):
         """创建备用的PatternMatcher"""
@@ -321,22 +349,30 @@ class MoveVideosTab:
         return FallbackMatcher()
 
     def create_ui(self):
-        """创建界面 - 增加动态状态列"""
+        """创建界面 - 用内部页签区分操作步骤，避免单页内容过长显示不全"""
+        # 内部页签容器：①执行设置 ②结果与验证 ③手动配对
+        self.notebook = ttk.Notebook(self.frame)
+        self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        self.exec_page = ttk.Frame(self.notebook)
+        self.result_page = ttk.Frame(self.notebook)
+        self.pair_page = ttk.Frame(self.notebook)
+        self.notebook.add(self.exec_page, text=" ① 执行设置 ")
+        self.notebook.add(self.result_page, text=" ② 结果与验证 ")
+        self.notebook.add(self.pair_page, text=" ③ 手动配对 ")
+
         # 1. 功能说明
-        info_frame = ttk.LabelFrame(self.frame, text="功能说明")
+        info_frame = ttk.LabelFrame(self.exec_page, text="功能说明")
         info_frame.pack(fill=tk.X, padx=10, pady=10)
 
         info_text = (
-            "高性能异步移动模式：\n"
-            "• 直接快速移动：使用系统级移动操作，极速处理大文件\n"
-            "• 异步验证：移动后立即显示在列表，后台验证完整性\n" 
-            "• 自动恢复：验证失败时自动将文件恢复到原位置\n"
-            "• 状态追踪：蓝色=验证中，绿色=成功，红色=失败"
+            "高性能异步移动：系统级快速移动 + 后台异步验证（验证失败自动恢复原位置）\n"
+            "状态颜色：蓝色=验证中，绿色=成功，红色=失败；未移动视频请在「手动配对」页处理"
         )
-        ttk.Label(info_frame, text=info_text, justify=tk.LEFT, wraplength=1100).pack(padx=10, pady=10, fill=tk.X)
+        ttk.Label(info_frame, text=info_text, justify=tk.LEFT, wraplength=1000).pack(padx=10, pady=8, fill=tk.X)
 
         # 2. 文件夹设置
-        folder_frame = ttk.LabelFrame(self.frame, text="文件夹设置")
+        folder_frame = ttk.LabelFrame(self.exec_page, text="文件夹设置")
         folder_frame.pack(fill=tk.X, padx=10, pady=10)
 
         # 视频文件夹
@@ -356,14 +392,23 @@ class MoveVideosTab:
         ttk.Button(target_row, text="浏览...", command=self.browse_target_folder).pack(side=tk.RIGHT)
 
         # 3. 操作选项
-        option_frame = ttk.LabelFrame(self.frame, text="操作选项")
+        option_frame = ttk.LabelFrame(self.exec_page, text="操作选项")
         option_frame.pack(fill=tk.X, padx=10, pady=10)
         self.include_subfolders_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(option_frame, text="包含子文件夹（递归遍历所有子目录）", 
                        variable=self.include_subfolders_var).pack(anchor=tk.W, padx=10, pady=8)
 
+        # 并发移动数
+        worker_row = ttk.Frame(option_frame)
+        worker_row.pack(anchor=tk.W, padx=10, pady=4)
+        ttk.Label(worker_row, text="并发移动数:").pack(side=tk.LEFT)
+        self.move_workers_var = tk.IntVar(value=4)
+        ttk.Spinbox(worker_row, from_=1, to=16, textvariable=self.move_workers_var,
+                    width=6, state='readonly').pack(side=tk.LEFT, padx=5)
+        ttk.Label(worker_row, text="（跨磁盘/网络移动时调高可显著提速）").pack(side=tk.LEFT)
+
         # 4. 进度条
-        progress_frame = ttk.LabelFrame(self.frame, text="操作进度")
+        progress_frame = ttk.LabelFrame(self.exec_page, text="操作进度")
         progress_frame.pack(fill=tk.X, padx=10, pady=10)
 
         self.progress_var = tk.DoubleVar(value=0)
@@ -379,7 +424,7 @@ class MoveVideosTab:
         self.stats_label.pack()
 
         # 5. 按钮
-        button_frame = ttk.Frame(self.frame)
+        button_frame = ttk.Frame(self.exec_page)
         button_frame.pack(fill=tk.X, padx=10, pady=5)
 
         ttk.Button(button_frame, text="保存设置", command=self.save_settings, width=15).pack(side=tk.LEFT, padx=5)
@@ -389,8 +434,8 @@ class MoveVideosTab:
                                   width=10, state=tk.DISABLED)
         self.stop_btn.pack(side=tk.LEFT, padx=5)
 
-        # 6. 结果表格 - 增加状态列
-        table_frame = ttk.LabelFrame(self.frame, text="操作结果（蓝色=验证中，绿色=成功，红色=失败，点击记录查看路径）")
+        # 6. 结果表格 - 增加状态列（挂到②结果与验证页签）
+        table_frame = ttk.LabelFrame(self.result_page, text="操作结果（蓝色=验证中，绿色=成功，红色=失败，点击记录查看路径）")
         table_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
         columns = ('filename', 'foldername', 'status', 'action')
@@ -414,21 +459,70 @@ class MoveVideosTab:
         self.result_tree.tag_configure('success', foreground='green')
         self.result_tree.tag_configure('failed', foreground='red')
         self.result_tree.tag_configure('verifying', foreground='blue')
+        self.result_tree.tag_configure('unmoved', foreground='#c0392b')
+        self.result_tree.tag_configure('empty', foreground='#7f8c8d')
 
         # 绑定事件
         self.result_tree.bind('<<TreeviewSelect>>', self.on_tree_select)
         self.result_tree.bind('<ButtonRelease-1>', self.on_tree_click)
 
-        # 7. 路径显示区域
-        path_frame = ttk.LabelFrame(self.frame, text="目标路径详情（选中上方记录显示）")
+        # 7. 路径显示区域（挂在②结果与验证页签内）
+        path_frame = ttk.LabelFrame(self.result_page, text="目标路径详情（选中上方记录显示）")
         path_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
 
         self.path_var = tk.StringVar(value="点击上方表格中的记录，此处将显示移动后的完整文件夹路径...")
         path_entry = ttk.Entry(path_frame, textvariable=self.path_var, state='readonly', font=('Consolas', 10))
         path_entry.pack(fill=tk.X, padx=10, pady=8)
 
-        ttk.Button(self.frame, text="清空结果记录", command=self.clear_records).pack(anchor=tk.E, padx=10, pady=5)
+        ttk.Button(self.result_page, text="清空结果记录", command=self.clear_records).pack(anchor=tk.E, padx=10, pady=5)
+
+        # 8. 手动配对面板（未移动视频 + 空文件夹，可人工配对并同步深度学习）
+        self._create_pairing_ui()
     
+    def _create_pairing_ui(self):
+        """创建手动配对面板：左侧未移动视频，右侧空目标文件夹（独立③页签）"""
+        pair_frame = ttk.LabelFrame(self.pair_page, text="手动配对（选中左侧视频 + 右侧空文件夹，配对即移动，并同步番号深度学习）")
+        pair_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        list_row = ttk.Frame(pair_frame)
+        list_row.pack(fill=tk.X, padx=10, pady=8)
+
+        # 左：未移动视频
+        left_col = ttk.Frame(list_row)
+        left_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
+        ttk.Label(left_col, text="未移动视频：").pack(anchor=tk.W)
+        self.unmoved_listbox = tk.Listbox(left_col, height=30, exportselection=False)
+        self.unmoved_listbox.pack(fill=tk.BOTH, expand=True)
+        self.unmoved_listbox.bind('<<ListboxSelect>>', self._on_pair_select)
+
+        # 右：空目标文件夹
+        right_col = ttk.Frame(list_row)
+        right_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(5, 0))
+        ttk.Label(right_col, text="空目标文件夹：").pack(anchor=tk.W)
+        self.empty_listbox = tk.Listbox(right_col, height=30, exportselection=False)
+        self.empty_listbox.pack(fill=tk.BOTH, expand=True)
+        self.empty_listbox.bind('<<ListboxSelect>>', self._on_pair_select)
+
+        # 选中信息
+        self.pair_info_var = tk.StringVar(value="（未选择）")
+        ttk.Label(pair_frame, textvariable=self.pair_info_var, foreground="blue").pack(fill=tk.X, padx=10)
+
+        btn_row = ttk.Frame(pair_frame)
+        btn_row.pack(fill=tk.X, padx=10, pady=6)
+        ttk.Button(btn_row, text="配对并移动", command=self.manual_pair_move).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_row, text="批量试探配对", command=self.batch_auto_pair).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_row, text="重新扫描待处理", command=self.analyze_leftovers).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_row, text="清空配对列表", command=self._clear_pairing_lists).pack(side=tk.LEFT, padx=5)
+
+        # 深度学习库规模显示
+        self.learner_stat_var = tk.StringVar(value="深度学习库: 加载中...")
+        ttk.Label(pair_frame, textvariable=self.learner_stat_var, foreground="#555555").pack(fill=tk.X, padx=10, pady=(0, 6))
+        self._update_learner_stats_label()
+
+        # 记录列表框里的显示文本 -> 真实路径
+        self._unmoved_lb_map: Dict[str, Path] = {}
+        self._empty_lb_map: Dict[str, Path] = {}
+
     def check_ui_updates(self):
         """检查UI更新队列 - 处理异步验证结果"""
         try:
@@ -580,6 +674,8 @@ class MoveVideosTab:
         """建立文件夹索引"""
         self.folder_index.clear()
         self.name_index.clear()
+        self.all_target_folders = []
+        self.used_target_folders = set()
 
         code_index_count = 0
         name_index_count = 0
@@ -599,6 +695,20 @@ class MoveVideosTab:
             except Exception as e:
                 self.log(f"访问目标文件夹失败: {e}")
                 return 0, 0
+
+        # 记录全部目标子文件夹，供事后统计"空文件夹"
+        self.all_target_folders = [fp for fp, _ in folders_to_process]
+
+        # 扫描阶段即标记每个目标子文件夹是否已含视频文件（供空文件夹判定，只扫一次）
+        self.folder_video_flag: Dict[Path, bool] = {}
+        for fp in self.all_target_folders:
+            try:
+                self.folder_video_flag[fp] = any(
+                    item.is_file() and item.suffix.lower() in VIDEO_EXTENSIONS
+                    for item in fp.iterdir())
+            except OSError:
+                # 无法访问时保守处理：视为非空，后续配对列表中剔除
+                self.folder_video_flag[fp] = True
 
         for folder_path, dir_name in folders_to_process:
             if not self.is_running:
@@ -744,17 +854,27 @@ class MoveVideosTab:
         best = max(candidates, key=lambda x: (x[1], -len(str(x[0]['path']))))
         return best[0]['path']
     def collect_video_files(self, video_path: Path, include_subfolders: bool) -> List[Path]:
-        """收集视频文件"""
+        """收集视频文件
+
+        同时只遍历一次源文件夹，把所有文件按目录存入 self.source_file_map，
+        供后续匹配字幕时直接使用，避免每移动一个视频就重复遍历整个源目录。
+        """
         video_files = []
+        self.source_file_map = {}
         if include_subfolders:
             for root, dirs, files in os.walk(video_path):
-                for file in files:
-                    if Path(file).suffix.lower() in VIDEO_EXTENSIONS:
-                        video_files.append(Path(root) / file)
+                root_p = Path(root)
+                file_list = [root_p / f for f in files]
+                if file_list:
+                    self.source_file_map[root_p] = file_list
+                for f in files:
+                    if Path(f).suffix.lower() in VIDEO_EXTENSIONS:
+                        video_files.append(root_p / f)
         else:
             try:
-                video_files = [f for f in video_path.iterdir() 
-                              if f.is_file() and f.suffix.lower() in VIDEO_EXTENSIONS]
+                file_list = [video_path / f for f in video_path.iterdir() if (video_path / f).is_file()]
+                self.source_file_map[video_path] = file_list
+                video_files = [p for p in file_list if p.suffix.lower() in VIDEO_EXTENSIONS]
             except Exception as e:
                 self.log(f"获取视频文件失败: {e}")
         return video_files
@@ -790,12 +910,26 @@ class MoveVideosTab:
             return False, None, str(e), False
 
     def move_subtitles(self, video_path: Path, target_folder: Path) -> List[Path]:
-        """移动字幕文件"""
+        """移动字幕文件
+
+        直接使用 collect_video_files 阶段预构建的 self.source_file_map，
+        不再对每个视频重新遍历整个源目录（这是原版慢的重要原因）。
+        """
         moved = []
         source_dir = video_path.parent
         video_stem = video_path.stem.lower()
 
-        for sub_file in source_dir.iterdir():
+        # 优先使用预构建的文件映射（同一目录下的所有文件），避免重复磁盘遍历
+        sub_files = self.source_file_map.get(source_dir, [])
+        if not sub_files:
+            # 兜底：映射缺失时回退到目录扫描
+            try:
+                sub_files = [source_dir / f for f in source_dir.iterdir() if (source_dir / f).is_file()]
+            except Exception:
+                return moved
+
+        for sub_file in sub_files:
+            # 文件可能已被移动，跳过不存在的
             if not sub_file.is_file():
                 continue
             if sub_file.suffix.lower() not in SUBTITLE_EXTENSIONS:
@@ -864,6 +998,11 @@ class MoveVideosTab:
 
     def _move_operation_thread(self, video_path: Path, target_path: Path, include_subfolders: bool):
         """后台线程执行移动操作 - 极速版"""
+        # 记录本次操作上下文，供完成后统计待处理数据
+        self._op_video_path = video_path
+        self._op_target_path = target_path
+        self._op_include_sub = include_subfolders
+
         self.log("=" * 60)
         self.log(f"开始移动操作（快速直接移动 + 异步验证）")
         self.log(f"视频文件夹: {video_path}")
@@ -901,65 +1040,90 @@ class MoveVideosTab:
         self.update_progress(20, f"准备处理 {total_files} 个视频...", 
                            {'code_index': code_count, 'total_videos': total_files, 'verifying': 0, 'success': 0, 'failed': 0, 'unmatched': 0})
 
-        # 阶段3: 批量匹配和快速移动
+        # 阶段3: 先批量匹配（纯内存，只遍历目标索引一次，不再逐文件重复磁盘遍历）
+        tasks = []  # 元素: (video_file, 目标文件夹, 序号)
+        unmatched = 0
+        for index, video_file in enumerate(video_files, 1):
+            if not self.is_running:
+                break
+            # 使用"深度学习增强"的提取：先查人工修正记忆，再走常规规则
+            file_code = self._extract_code(video_file.stem)
+            best_match = self.find_best_match(video_file.name, file_code)
+            if not best_match:
+                unmatched += 1
+                self.log(f"[未匹配] {video_file.name}")
+                continue
+            tasks.append((video_file, best_match, index))
+
+        total = len(tasks)
+        self.log(f"匹配完成: {total} 个视频待移动, {unmatched} 个未匹配")
+
         stats = {
             'verifying': 0,
             'success': 0,
             'failed': 0,
-            'unmatched': 0
+            'unmatched': unmatched
         }
 
-        for index, video_file in enumerate(video_files, 1):
-            if not self.is_running:
-                break
+        if total == 0:
+            self.update_progress(100, f"无匹配文件（未匹配: {unmatched}）",
+                                 {'code_index': code_count, 'total_videos': total_files, **stats})
+            self.frame.after(0, self._operation_completed, 0)
+            return
 
-            progress = 20 + int((index / total_files) * 80)
-            
-            file_code = None
-            if self.matcher:
-                file_code = self.matcher.extract_code(video_file.stem)
+        # 阶段4: 并发移动（跨磁盘/网络移动时，多线程可大幅缩短总耗时）
+        max_workers = max(1, min(self.move_workers_var.get(), 16))
+        completed = 0
+        progress_lock = threading.Lock()
 
-            best_match = self.find_best_match(video_file.name, file_code)
-
-            if not best_match:
-                self.log(f"[未匹配] {video_file.name}")
-                stats['unmatched'] += 1
-                self.update_progress(progress, f"处理 {index}/{total_files}: {video_file.name[:30]}... (未匹配)", 
-                                   {'code_index': code_count, 'total_videos': total_files, **stats})
-                continue
-
-            # 执行快速移动（在后台线程直接操作，不阻塞）
-            success, dest_path, error_msg, was_renamed = self.quick_move_file(video_file, best_match)
-
+        def do_move(video_file: Path, target: Path, index: int):
+            """在线程池中执行的单个移动任务"""
+            success, dest_path, error_msg, was_renamed = self.quick_move_file(video_file, target)
+            moved_subs = []
             if success:
-                stats['verifying'] += 1
-                item_id = f"ITEM_{index}_{int(time.time() * 1000)}"
-                self.frame.after(0, self._add_verifying_record, item_id, video_file, dest_path, best_match.name)
-                self.verify_worker.submit_verify(item_id, video_file, dest_path)
-                
-                if was_renamed:
-                    self.log(f"⚠️ [重命名] {video_file.name} -> {dest_path.name} (目标文件夹已存在同名文件)")
-                else:
-                    self.log(f"[移动完成-待验证] {video_file.name} -> {best_match.name}")
+                # 字幕匹配使用预构建的内存映射，无磁盘遍历
+                moved_subs = self.move_subtitles(video_file, target)
+            return success, dest_path, error_msg, was_renamed, moved_subs
 
-                moved_subs = self.move_subtitles(video_file, best_match)
-                if moved_subs:
-                    self.log(f"  [字幕] 共移动 {len(moved_subs)} 个字幕文件")
-            else:
-                stats['failed'] += 1
-                self.log(f"[移动失败] {video_file.name}: {error_msg}")
-                self.frame.after(0, self._add_failed_record, video_file, best_match.name, error_msg)
-            
-            # 每10个文件更新一次进度，减少UI负担
-            if index % 10 == 0 or index == total_files:
-                self.update_progress(progress, f"处理 {index}/{total_files}: {video_file.name[:30]}...", 
-                                   {'code_index': code_count, 'total_videos': total_files, **stats})
+        try:
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = {pool.submit(do_move, vf, tg, idx): (vf, tg, idx)
+                           for vf, tg, idx in tasks}
+                for fut in as_completed(futures):
+                    if not self.is_running:
+                        # 停止：取消尚未开始的移动任务
+                        pool.shutdown(wait=False, cancel_futures=True)
+                        break
+                    vf, tg, idx = futures[fut]
+                    try:
+                        success, dest_path, error_msg, was_renamed, moved_subs = fut.result()
+                    except Exception as e:
+                        success, dest_path, error_msg, moved_subs = False, None, str(e), []
+
+                    # 结果回主线程更新 UI 并提交异步验证
+                    self.frame.after(0, self._apply_move_result,
+                                     vf, tg, dest_path, success, error_msg, was_renamed, moved_subs)
+
+                    with progress_lock:
+                        completed += 1
+                        if success:
+                            stats['verifying'] += 1
+                        else:
+                            stats['failed'] += 1
+                        done = completed
+
+                    progress = 20 + int((done / total) * 80)
+                    self.update_progress(progress, f"处理 {done}/{total}: {vf.name[:30]}...",
+                                         {'code_index': code_count, 'total_videos': total_files, **stats})
+        except Exception as e:
+            self.log(f"[线程池异常] {e}")
 
         self.update_progress(100, f"移动完成，后台验证中...（验证中: {stats['verifying']}）", 
                            {'code_index': code_count, 'total_videos': total_files, **stats})
 
         self.log("\n" + "=" * 60)
-        self.log(f"移动阶段完成: 总数{total_files}, 验证中{stats['verifying']}, 未匹配{stats['unmatched']}, 立即失败{stats['failed']}")
+        self.log(f"移动阶段完成: 总数{total_files}, 匹配{total}, 验证中{stats['verifying']}, "
+                 f"未匹配{unmatched}, 立即失败{stats['failed']}")
         self.log("后台正在验证文件完整性，验证失败的文件将自动恢复...")
         self.log("=" * 60)
 
@@ -1001,16 +1165,372 @@ class MoveVideosTab:
         }
         self.move_records[item_id] = record
 
+    def _apply_move_result(self, source_path: Path, target_folder: Path, dest_path: Optional[Path],
+                           success: bool, error_msg: str, was_renamed: bool, moved_subs: List[Path]):
+        """将单个移动任务结果应用到 UI（在主线程调度执行）"""
+        if success:
+            item_id = f"ITEM_{int(time.time() * 1000)}_{id(source_path)}"
+            self.result_tree.insert('', tk.END, iid=item_id, values=(
+                source_path.name, target_folder.name, '⟳ 验证中...', '撤回'
+            ), tags=('verifying',))
+
+            record = {
+                'item_id': item_id,
+                'source_path': source_path,
+                'dest_path': dest_path,
+                'filename': source_path.name,
+                'foldername': target_folder.name,
+                'status': 'verifying',
+                'status_text': '⟳ 验证中...'
+            }
+            self.move_records[item_id] = record
+            self.verify_worker.submit_verify(item_id, source_path, dest_path)
+            # 记录该目标文件夹已被使用，供事后统计"空文件夹"
+            self.used_target_folders.add(target_folder)
+
+            if was_renamed:
+                self.log(f"⚠️ [重命名] {source_path.name} -> {dest_path.name} (目标文件夹已存在同名文件)")
+            else:
+                self.log(f"[移动完成-待验证] {source_path.name} -> {target_folder.name}")
+
+            if moved_subs:
+                self.log(f"  [字幕] 共移动 {len(moved_subs)} 个字幕文件")
+        else:
+            self.log(f"[移动失败] {source_path.name}: {error_msg}")
+            self._add_failed_record(source_path, target_folder.name, error_msg)
+
     def _operation_completed(self, pending_count=0):
         """操作完成回调"""
         self.execute_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED)
         self.is_running = False
-        
+
+        # 事后分析：未移动视频 + 空文件夹，并刷新手动配对列表
+        self.analyze_leftovers()
+
         if pending_count > 0:
-            messagebox.showinfo("移动完成", f"文件移动阶段完成！\n{pending_count} 个文件正在后台验证完整性...\n\n验证失败的文件将自动恢复到原位置。")
+            messagebox.showinfo("移动完成", f"文件移动阶段完成！\n{pending_count} 个文件正在后台验证完整性...\n\n"
+                                      f"另有 {len(self.unmoved_videos)} 个视频未移动、{len(self.empty_folders)} 个目标文件夹为空，"
+                                      f"可在下方「手动配对」中处理（会同步深度学习）。")
         else:
             messagebox.showinfo("完成", "操作完成！所有文件已处理。")
+
+    # ------------------------------------------------------------------ 事后统计与手动配对
+    def _extract_code(self, text: str) -> Optional[Dict]:
+        """番号提取（优先使用带深度学习的 extract_code_smart）"""
+        if not self.matcher:
+            return None
+        fn = getattr(self.matcher, 'extract_code_smart', None)
+        return fn(text) if fn else self.matcher.extract_code(text)
+
+    def _collect_remaining_videos(self, video_path: Path, include_sub: bool) -> List[Path]:
+        """重新扫描源文件夹，返回仍然存在的视频（即未移动成功的）"""
+        result: List[Path] = []
+        try:
+            if include_sub:
+                for root, dirs, files in os.walk(video_path):
+                    for f in files:
+                        if Path(f).suffix.lower() in VIDEO_EXTENSIONS:
+                            result.append(Path(root) / f)
+            else:
+                result = [video_path / f for f in video_path.iterdir()
+                          if (video_path / f).is_file() and f.suffix.lower() in VIDEO_EXTENSIONS]
+        except Exception as e:
+            self.log(f"重新扫描源文件夹失败: {e}")
+        return result
+
+    def _is_pairable_empty_folder(self, folder: Path) -> bool:
+        """判定目标文件夹是否可进入「空文件夹/手动配对」清单：
+        1) 文件夹内已有视频文件（扫描阶段已标记） -> 剔除；
+        2) 文件夹名含「（个人）」或「(个人)」 -> 剔除；
+        3) 文件夹名识别不出番号 -> 剔除。
+        """
+        # 1) 是否已有视频（优先用扫描阶段标记；无标记时现场扫描一次并缓存）
+        flag_map = getattr(self, 'folder_video_flag', None)
+        if flag_map is None:
+            flag_map = self.folder_video_flag = {}
+        flag = flag_map.get(folder)
+        if flag is None:
+            try:
+                flag = any(item.is_file() and item.suffix.lower() in VIDEO_EXTENSIONS
+                           for item in folder.iterdir())
+            except OSError:
+                flag = True  # 无法访问时保守处理：视为非空剔除
+            flag_map[folder] = flag
+        if flag:
+            return False
+
+        # 2) 名称含「（个人）」或「(个人)」的文件夹不参与配对
+        if '个人' in folder.name:
+            return False
+
+        # 3) 无法识别番号的文件夹不参与配对
+        return self._extract_code(folder.name) is not None
+
+    def analyze_leftovers(self):
+        """统计未移动视频与空文件夹，并刷新配对列表（操作完成后或点「重新扫描」时调用）"""
+        video_path = getattr(self, '_op_video_path', None)
+        target_path = getattr(self, '_op_target_path', None)
+        include_sub = getattr(self, '_op_include_sub', False)
+
+        self.unmoved_videos = []
+        self.empty_folders = []
+
+        if video_path and target_path:
+            # 未移动视频：源文件夹中仍然存在的视频
+            self.unmoved_videos = self._collect_remaining_videos(video_path, include_sub)
+            # 空文件夹：全部目标子文件夹中，本次没有视频移入、且通过配对资格判定的
+            # （已有视频文件 / 名称含「个人」/ 无法识别番号的均剔除）
+            self.empty_folders = [p for p in self.all_target_folders
+                                  if p not in self.used_target_folders
+                                  and self._is_pairable_empty_folder(p)]
+
+        self._list_leftovers_in_tree()
+        self._populate_pairing_ui()
+        self._update_learner_stats_label()
+        self.log(f"事后统计：未移动视频 {len(self.unmoved_videos)} 个，空目标文件夹 {len(self.empty_folders)} 个")
+
+    def _list_leftovers_in_tree(self):
+        """在结果表中列出待处理项（未移动视频 / 空文件夹），先清除上次残留"""
+        for iid in getattr(self, '_leftover_item_ids', []):
+            try:
+                self.result_tree.delete(iid)
+            except Exception:
+                pass
+        self._leftover_item_ids = []
+
+        for p in self.unmoved_videos:
+            iid = f"UNMOVED_{id(p)}"
+            self.result_tree.insert('', tk.END, iid=iid,
+                                    values=(p.name, '—', '未移动', ''), tags=('unmoved',))
+            self._leftover_item_ids.append(iid)
+
+        for p in self.empty_folders:
+            iid = f"EMPTY_{id(p)}"
+            self.result_tree.insert('', tk.END, iid=iid,
+                                    values=(p.name, str(p), '空文件夹', ''), tags=('empty',))
+            self._leftover_item_ids.append(iid)
+
+    def _populate_pairing_ui(self):
+        """刷新手动配对列表框"""
+        self.unmoved_listbox.delete(0, tk.END)
+        self.empty_listbox.delete(0, tk.END)
+        self._unmoved_lb_map.clear()
+        self._empty_lb_map.clear()
+        for p in self.unmoved_videos:
+            self._unmoved_lb_map[p.name] = p
+            self.unmoved_listbox.insert(tk.END, p.name)
+        for p in self.empty_folders:
+            txt = f"{p.name}  |  {p}"
+            self._empty_lb_map[txt] = p
+            self.empty_listbox.insert(tk.END, txt)
+        self._update_pair_info()
+
+    def _on_pair_select(self, event=None):
+        self._update_pair_info()
+
+    def _update_pair_info(self):
+        sel_v = self.unmoved_listbox.curselection()
+        sel_f = self.empty_listbox.curselection()
+        v = self._unmoved_lb_map.get(self.unmoved_listbox.get(sel_v[0])) if sel_v else None
+        f = self._empty_lb_map.get(self.empty_listbox.get(sel_f[0])) if sel_f else None
+        if not v and not f:
+            self.pair_info_var.set("（未选择）")
+            return
+        parts = []
+        if v:
+            auto = self._extract_code(v.stem) if self.matcher else None
+            parts.append(f"视频: {v.name}（自动番号: {auto['full'] if auto else '无'}）")
+        if f:
+            code = self.matcher.extract_code(f.name) if self.matcher else None
+            parts.append(f"文件夹: {f.name}（识别番号: {code['full'] if code else '无'}）")
+        self.pair_info_var.set("  |  ".join(parts))
+
+    def _move_subtitles_for_path(self, video_path: Path, target_folder: Path) -> List[Path]:
+        """手动配对时为单个视频移动字幕（直接扫描其目录，不依赖可能过期的映射）"""
+        moved: List[Path] = []
+        source_dir = video_path.parent
+        video_stem = video_path.stem.lower()
+        try:
+            subs = [source_dir / f for f in source_dir.iterdir() if (source_dir / f).is_file()]
+        except Exception:
+            return moved
+        for sub_file in subs:
+            if sub_file.suffix.lower() not in SUBTITLE_EXTENSIONS:
+                continue
+            if sub_file.stem.lower().startswith(video_stem):
+                success, dest_path, error_msg, was_renamed = self.quick_move_file(sub_file, target_folder)
+                if success:
+                    moved.append(dest_path)
+                else:
+                    self.log(f"  [字幕移动失败] {sub_file.name}: {error_msg}")
+        return moved
+
+    def _learn_from_pair(self, video_path: Path, folder_path: Path):
+        """把"视频文件名特征 -> 文件夹识别出的番号"记入深度学习库（与 workflow 共用 uid_learn.json）"""
+        if not self.uid_learner or not self.matcher:
+            return
+        folder_code = self.matcher.extract_code(folder_path.name)
+        if not folder_code:
+            return
+        corrected_uid = folder_code['full']  # 例如 'ssis001'
+        auto = self._extract_code(video_path.stem)
+        auto_uid = auto['full'] if auto else ''
+        try:
+            changed = self.uid_learner.learn(video_path.stem, corrected_uid, auto_uid)
+            if changed:
+                self.log(f"[深度学习] 已记录修正: {video_path.stem} -> {corrected_uid}")
+                self._update_learner_stats_label()
+        except Exception as e:
+            self.log(f"[深度学习] 记录失败: {e}")
+
+    def _register_moved(self, source_path: Path, folder_name: str, dest_path: Path):
+        """在结果表中登记一条"验证中"记录并提交异步验证（与自动移动一致）"""
+        item_id = f"ITEM_{int(time.time() * 1000)}_{id(source_path)}"
+        self.result_tree.insert('', tk.END, iid=item_id, values=(
+            source_path.name, folder_name, '⟳ 验证中...', '撤回'
+        ), tags=('verifying',))
+        record = {
+            'item_id': item_id,
+            'source_path': source_path,
+            'dest_path': dest_path,
+            'filename': source_path.name,
+            'foldername': folder_name,
+            'status': 'verifying',
+            'status_text': '⟳ 验证中...'
+        }
+        self.move_records[item_id] = record
+        self.verify_worker.submit_verify(item_id, source_path, dest_path)
+        return item_id
+
+    def manual_pair_move(self):
+        """手动配对：把选中的未移动视频移动到选中的空文件夹，并同步深度学习"""
+        sel_v = self.unmoved_listbox.curselection()
+        sel_f = self.empty_listbox.curselection()
+        if not sel_v or not sel_f:
+            messagebox.showwarning("提示", "请在左右两侧各选择一个「未移动视频」和一个「空目标文件夹」")
+            return
+        video_path = self._unmoved_lb_map.get(self.unmoved_listbox.get(sel_v[0]))
+        folder_path = self._empty_lb_map.get(self.empty_listbox.get(sel_f[0]))
+        if not video_path or not folder_path:
+            return
+
+        if not messagebox.askyesno("确认配对",
+                                   f"将视频\n  {video_path.name}\n移动到文件夹\n  {folder_path}\n\n"
+                                   f"同时把该配对记入番号深度学习库（下次自动识别更准确）？"):
+            return
+
+        success, dest_path, error_msg, was_renamed = self.quick_move_file(video_path, folder_path)
+        if not success:
+            messagebox.showerror("失败", f"移动失败: {error_msg}")
+            self.log(f"[手动配对-失败] {video_path.name}: {error_msg}")
+            return
+
+        moved_subs = self._move_subtitles_for_path(video_path, folder_path)
+        self.used_target_folders.add(folder_path)
+        self._learn_from_pair(video_path, folder_path)
+        self._register_moved(video_path, folder_path.name, dest_path)
+
+        self.log(f"[手动配对-成功] {video_path.name} -> {folder_path.name}")
+        if moved_subs:
+            self.log(f"  [字幕] 共移动 {len(moved_subs)} 个字幕文件")
+
+        # 从待处理列表移除并更新 UI
+        self.unmoved_videos = [p for p in self.unmoved_videos if p != video_path]
+        if folder_path in self.empty_folders:
+            self.empty_folders.remove(folder_path)
+        self._populate_pairing_ui()
+
+    def _clear_pairing_lists(self):
+        """清空配对列表框（仅清显示，不影响其它状态）"""
+        self.unmoved_videos = []
+        self.empty_folders = []
+        self._populate_pairing_ui()
+
+    def _update_learner_stats_label(self):
+        """刷新界面上的深度学习库规模显示"""
+        if not self.uid_learner:
+            self.learner_stat_var.set("深度学习库: 未加载（人工修正记忆不可用）")
+            return
+        try:
+            s = self.uid_learner.stats()
+            self.learner_stat_var.set(
+                f"深度学习库(uid_learn.json): 精确记忆 {s.get('mappings', 0)} 条 / "
+                f"垃圾前缀 {s.get('junk_prefixes', 0)} 条 / 垃圾后缀 {s.get('junk_suffixes', 0)} 条")
+        except Exception:
+            self.learner_stat_var.set("深度学习库: 统计失败")
+
+    def batch_auto_pair(self):
+        """批量试探配对：按番号相等或"文件夹名是视频文件名前缀"自动配对未移动视频与空文件夹
+
+        仅做"试探"，配对前弹窗让用户确认；成功移动的项一并记入深度学习库。
+        """
+        if not self.unmoved_videos or not self.empty_folders:
+            messagebox.showinfo("提示", "当前没有可自动配对的『未移动视频』或『空文件夹』")
+            return
+
+        # 为每个空文件夹预计算番号（键），空文件夹只作为目标被用一次
+        folder_candidates = []  # (folder_path, code_dict_or_None)
+        for f in self.empty_folders:
+            folder_candidates.append((f, self._extract_code(f.name)))
+
+        pairs = []
+        used_videos = set()
+        used_folders = set()
+
+        for v in self.unmoved_videos:
+            if v in used_videos:
+                continue
+            vcode = self._extract_code(v.stem)
+            vclean = re.sub(r'[\s\-_\.]+', '', v.stem).lower()
+            best = None
+            for f, fcode in folder_candidates:
+                if f in used_folders:
+                    continue
+                # 1) 番号严格相等（说明原匹配因其它原因漏掉）
+                if (vcode and fcode and vcode.get('full') and fcode.get('full')
+                        and vcode['full'] == fcode['full']):
+                    best = f
+                    break
+                # 2) 文件夹名（去噪）作为视频文件名前缀 -> 试探配对
+                fclean = re.sub(r'[\s\-_\.]+', '', f.name).lower()
+                if fclean and len(fclean) >= 3 and vclean.startswith(fclean):
+                    best = f
+                    break
+            if best:
+                pairs.append((v, best))
+                used_videos.add(v)
+                used_folders.add(best)
+
+        if not pairs:
+            messagebox.showinfo("提示", "未找到可自动配对的项（可改用手动配对，或先人工修正番号）")
+            return
+
+        if not messagebox.askyesno("确认批量配对",
+                                   f"将自动试探配对 {len(pairs)} 对并移动（同时同步深度学习）：\n\n"
+                                   + "\n".join(f"• {v.name}  →  {f.name}" for v, f in pairs[:20])
+                                   + ("\n…" if len(pairs) > 20 else "")):
+            return
+
+        ok = 0
+        for v, f in pairs:
+            success, dest_path, error_msg, was_renamed = self.quick_move_file(v, f)
+            if success:
+                self._move_subtitles_for_path(v, f)
+                self.used_target_folders.add(f)
+                self._learn_from_pair(v, f)
+                self._register_moved(v, f.name, dest_path)
+                ok += 1
+                self.log(f"[批量配对-成功] {v.name} -> {f.name}")
+            else:
+                self.log(f"[批量配对-失败] {v.name}: {error_msg}")
+
+        # 从待处理列表移除已配对项并刷新
+        self.unmoved_videos = [p for p in self.unmoved_videos if p not in used_videos]
+        self.empty_folders = [p for p in self.empty_folders if p not in used_folders]
+        self._populate_pairing_ui()
+        self._update_learner_stats_label()
+        messagebox.showinfo("完成", f"批量配对完成：成功 {ok}/{len(pairs)}")
 
     def on_tree_select(self, event):
         """处理列表选择事件 - 显示完整路径"""

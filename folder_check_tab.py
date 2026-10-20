@@ -31,6 +31,7 @@ import struct
 import threading
 import queue
 import subprocess
+import shutil
 import tempfile
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -637,6 +638,20 @@ class FolderCheckTab:
     IMAGE_EXTENSIONS: Set[str] = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.jfif'}
     SUBTITLE_EXTENSIONS: Set[str] = {'.srt'}
 
+    # ============ 视频文件比对：左右两列按相同的属性行对齐 ============
+    VIDEO_INFO_FIELDS: Tuple[Tuple[str, str], ...] = (
+        ('type', '类型'),
+        ('size', '大小'),
+        ('location', '文件位置'),
+        ('modified', '修改日期'),
+        ('duration', '时长'),
+        ('width', '帧宽度'),
+        ('height', '帧高度'),
+        ('fps', '帧速率'),
+        ('data_rate', '数据速率'),
+        ('total_bitrate', '总比特率'),
+    )
+
     # 需要跳过的文件夹名标记
     SKIP_FOLDER_MARKERS = ['(个人)', '(不好看)']
 
@@ -720,6 +735,14 @@ class FolderCheckTab:
         self.drag_enabled = False
         self._drag_cmd_name = None
 
+        # ---------- 视频文件比对模式的数据 ----------
+        self.video_sides: Dict[str, Dict] = {}
+        # 后台线程写入、(side, gen) -> (path, info)，由主线程轮询取用（避免跨线程 after）
+        self.video_probe_results: Dict = {}
+        self._EmbeddedPlayerCls = None
+        self._ffprobe_path = None
+        self._vlc_path = None
+
         self._init_ui()
         self._load_config()
 
@@ -755,10 +778,14 @@ class FolderCheckTab:
         ttk.Radiobutton(
             mode_frame, text="单文件夹检查（视频命名/缺失检查）",
             variable=self.mode_var, value="check", command=self._on_mode_change
-        ).pack(side=tk.LEFT, padx=(0, 30))
+        ).pack(side=tk.LEFT, padx=(0, 24))
         ttk.Radiobutton(
             mode_frame, text="双文件夹比对（转码前后对比）",
             variable=self.mode_var, value="compare", command=self._on_mode_change
+        ).pack(side=tk.LEFT, padx=(0, 24))
+        ttk.Radiobutton(
+            mode_frame, text="视频文件比对（画面/属性对比）",
+            variable=self.mode_var, value="video", command=self._on_mode_change
         ).pack(side=tk.LEFT)
 
         # ========== 1. 单文件夹检查 - 配置区域 ==========
@@ -819,6 +846,14 @@ class FolderCheckTab:
 
         self.check_result_tab = self.result_notebook.tabs()[0]
         self.compare_result_tab = self.result_notebook.tabs()[1]
+
+        # ========== 6. 视频文件比对面板（独立于结果页签，初始隐藏） ==========
+        self.video_compare_frame = ttk.Frame(self.frame)
+        self._init_video_compare_ui(self.video_compare_frame)
+        self.video_compare_frame.grid_remove()
+
+        # 根据初始模式应用界面（显示正确的结果页签、隐藏无关页签与配置区）
+        self._on_mode_change()
 
     # ---------------------------------------------------------------------
     # 单文件夹检查 - 配置 UI
@@ -889,7 +924,7 @@ class FolderCheckTab:
         parent.rowconfigure(0, weight=1)
 
         columns = ("folder_path", "file_name", "folder_code", "file_code", "issue_type", "detail")
-        self.check_tree = ttk.Treeview(parent, columns=columns, show='headings', selectmode='browse')
+        self.check_tree = ttk.Treeview(parent, columns=columns, show='headings', selectmode='extended')
 
         column_config = {
             "folder_path": ("文件夹路径", 300),
@@ -914,6 +949,8 @@ class FolderCheckTab:
         self.context_menu.add_command(label="复制路径", command=self._copy_path)
         self.context_menu.add_command(label="复制文件名", command=self._copy_filename)
         self.context_menu.add_command(label="复制文件夹番号", command=self._copy_folder_code)
+        self.context_menu.add_separator()
+        self.context_menu.add_command(label="在网址抓取中搜索番号", command=self._search_code_in_webgrab)
         self.context_menu.add_separator()
         self.context_menu.add_command(label="在资源管理器中打开", command=self._open_in_explorer)
         self.check_tree.bind("<Button-3>", self._show_context_menu)
@@ -1077,17 +1114,58 @@ class FolderCheckTab:
         if mode == "check":
             self.compare_config_frame.grid_remove()
             self.check_config_frame.grid(row=1, column=0, sticky="ew", padx=10, pady=5)
-            self.result_notebook.select(self.check_result_tab)
+            self.run_btn.config(state=tk.NORMAL)
             self.stop_btn.config(state=tk.DISABLED)
             self.stats_label.config(text="就绪")
-        else:
+        elif mode == "compare":
             self.check_config_frame.grid_remove()
             self.compare_config_frame.grid(row=1, column=0, sticky="ew", padx=10, pady=5)
-            self.result_notebook.select(self.compare_result_tab)
+            self.run_btn.config(state=tk.NORMAL)
+            self.stop_btn.config(state=tk.DISABLED)
             self.stats_label.config(text="A文件夹: 0个文件 | B文件夹: 0个文件 | 已转码: 0 | 未转码: 0")
+        else:  # video
+            self.check_config_frame.grid_remove()
+            self.compare_config_frame.grid_remove()
+            self.run_btn.config(state=tk.DISABLED)
+            self.stop_btn.config(state=tk.DISABLED)
+            self.stats_label.config(
+                text="视频文件比对：将两个视频分别拖入左右区域，进行属性对比与同步播放")
+
+        # 显示区切换：视频比对使用独立面板，其余模式使用结果页签
+        if mode == "video":
+            self.result_notebook.grid_remove()
+            self.video_compare_frame.grid(
+                row=5, column=0, sticky="nsew", padx=10, pady=(5, 10))
+        else:
+            self.video_compare_frame.grid_remove()
+            self.result_notebook.grid(
+                row=5, column=0, sticky="nsew", padx=10, pady=(5, 10))
+            # 只显示当前模式对应的结果页签，隐藏无关的页签，保持界面清晰
+            self._apply_result_tabs(mode)
+
+        # 离开视频比对模式时停止隐藏的播放器，避免后台继续播放
+        if mode != "video":
+            self._stop_all_players()
+
         # 切换模式时重置进度条
         self.progress_var.set(0)
         self.export_btn.config(state=tk.DISABLED)
+
+    def _apply_result_tabs(self, mode: str):
+        """根据当前模式仅显示对应的“结果”页签，隐藏另一个
+
+        - 单文件夹检查 -> 仅显示“检查结果”
+        - 双文件夹比对 -> 仅显示“比对结果”（其内部再分“匹配结果/未转码文件”）
+        """
+        nb = self.result_notebook
+        if mode == "check":
+            nb.tab(self.compare_result_frame, state='hidden')
+            nb.tab(self.check_result_frame, state='normal')
+            nb.select(self.check_result_frame)
+        else:
+            nb.tab(self.check_result_frame, state='hidden')
+            nb.tab(self.compare_result_frame, state='normal')
+            nb.select(self.compare_result_frame)
 
     # =====================================================================
     # 配置加载 / 保存
@@ -1131,6 +1209,7 @@ class FolderCheckTab:
             self.source_folder = Path(source_path)
         if target_path:
             self.target_folder = Path(target_path)
+        self._vlc_path = section.get("vlc_path") or None
 
     def _save_config(self, show_tip: bool = False):
         """保存两类模式的配置到 app_config.json
@@ -1149,6 +1228,7 @@ class FolderCheckTab:
             "compare_video_only": self.compare_video_only_var.get(),
             "compare_source_history": list(self.source_history)[:self.HISTORY_MAX],
             "compare_target_history": list(self.target_history)[:self.HISTORY_MAX],
+            "vlc_path": self._vlc_path or "",
         }
         self.config_manager.set_section(self.CONFIG_SECTION, config, auto_save=True)
         self.log("[文件夹检查] 配置已保存")
@@ -1172,10 +1252,12 @@ class FolderCheckTab:
 
     def _run(self):
         """根据当前模式执行对应逻辑"""
-        if self.mode_var.get() == "check":
+        mode = self.mode_var.get()
+        if mode == "check":
             self._run_check()
-        else:
+        elif mode == "compare":
             self._start_compare()
+        # video 模式通过拖入文件后自动读取，无需“开始执行”
 
     # =====================================================================
     # 单文件夹检查模式 - 逻辑（移植自 video_check_tab.py）
@@ -1628,9 +1710,13 @@ class FolderCheckTab:
 
     def _show_context_menu(self, event):
         item = self.check_tree.identify_row(event.y)
-        if item:
+        if not item:
+            return
+        # 右键已选中的多行时保留当前多选；否则仅选中该行
+        selection = self.check_tree.selection()
+        if item not in selection:
             self.check_tree.selection_set(item)
-            self.context_menu.post(event.x_root, event.y_root)
+        self.context_menu.post(event.x_root, event.y_root)
 
     def _copy_path(self):
         selected = self.check_tree.selection()
@@ -1666,6 +1752,53 @@ class FolderCheckTab:
                 os.startfile(path)
             else:
                 self.show_toast("路径不存在或无法访问", "warning")
+
+    def _get_webgrab_tab(self):
+        """获取 web_grab 模块实例（不存在则返回 None）"""
+        controller = self.controller
+        if not controller:
+            return None
+        return getattr(controller.tabs, 'get', lambda k: None)('web_grab')
+
+    def _search_code_in_webgrab(self):
+        """把选中行（可多选）的番号发送到“网址抓取”模块，分别创建搜索页签（不切换主页面签）
+
+        番号优先取“文件夹番号”，为空时回退到“文件番号”；多个不同番号会创建多个搜索页签。
+        """
+        selected = self.check_tree.selection()
+        if not selected:
+            return
+        webgrab = self._get_webgrab_tab()
+        if webgrab is None or not hasattr(webgrab, 'search_list_by_keyword'):
+            self.show_toast("未找到“网址抓取”模块，无法创建搜索页签", "error")
+            return
+
+        # 收集番号（文件夹番号优先，回退到文件番号），去重并保持顺序
+        codes: List[str] = []
+        seen = set()
+        for item in selected:
+            values = self.check_tree.item(item)['values']
+            code = (str(values[2] or '').strip() or str(values[3] or '').strip())
+            if code and code not in seen:
+                seen.add(code)
+                codes.append(code)
+        if not codes:
+            self.show_toast("选中行没有可用的番号（文件夹番号/文件番号为空）", "warning")
+            return
+
+        ok = 0
+        for code in codes:
+            try:
+                if webgrab.search_list_by_keyword(code):
+                    ok += 1
+                else:
+                    self.log(f"[文件夹检查] 网址抓取缺少基础网址，未创建搜索页签：{code}")
+            except Exception as e:
+                self.log(f"[文件夹检查] 在网址抓取创建搜索页签失败：{code} - {e}")
+        if ok == 0:
+            self.show_toast("未能创建搜索页签：请先在“网址抓取”列表层打开一个站点", "warning")
+        else:
+            self.show_toast(f"已在“网址抓取”为 {ok} 个番号创建搜索页签", "success")
 
     # =====================================================================
     # 双文件夹比对模式 - 逻辑（移植自 file_compare_tab.py）
@@ -2404,6 +2537,1422 @@ class FolderCheckTab:
             return tree.tk.call('list', 'copy', 'DND_Files', data)
         except Exception:
             return 'refuse_drop'
+
+    # =====================================================================
+    # 视频文件比对模式：拖入两个视频 -> 属性对比 + 双播放器同步播放
+    # =====================================================================
+    def _get_embedded_player_class(self):
+        """延迟加载 video_grid_tab 里的内嵌播放器（缺少依赖时返回 None）"""
+        cached = self.__dict__.get('_EmbeddedPlayerCls')
+        if cached is not None:
+            return cached
+        try:
+            from video_grid_tab import EmbeddedPlayer
+            cached = EmbeddedPlayer
+        except Exception as e:
+            self.log(f"[视频文件比对] 无法加载内嵌播放器（缺少 opencv/Pillow？）: {e}")
+            cached = None
+        self._EmbeddedPlayerCls = cached
+        return cached
+
+    def _init_video_compare_ui(self, parent: ttk.Frame):
+        """构建视频文件比对面板：左右对称的拖放区 / 播放器 / 属性列表"""
+        parent.columnconfigure(0, weight=1)
+        parent.columnconfigure(1, weight=1)
+        parent.rowconfigure(1, weight=0)
+        parent.rowconfigure(2, weight=1)
+
+        # ---------- 顶部操作条 ----------
+        top = ttk.Frame(parent)
+        top.grid(row=0, column=0, columnspan=2, sticky="ew", padx=4, pady=(2, 4))
+
+        # ---------- 全局同步进度条（以时长较短的视频为准） ----------
+        gframe = ttk.Frame(parent)
+        gframe.grid(row=1, column=0, columnspan=2, sticky="ew", padx=4, pady=(0, 2))
+        self.global_scale_var = tk.DoubleVar(value=0.0)
+        self.global_time_var = tk.StringVar(value="00:00:00 / 00:00:00")
+        self.global_dragging = False
+        self.global_was_playing = {}
+        self.global_updating = False
+        ttk.Label(gframe, text="同步进度:").pack(side=tk.LEFT, padx=(0, 4))
+        gscale = ttk.Scale(gframe, from_=0.0, to=1.0,
+                           variable=self.global_scale_var, orient=tk.HORIZONTAL)
+        gscale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
+        gscale.configure(command=lambda v: self._on_global_scale_move(v))
+        gscale.bind('<ButtonPress-1>', lambda e: self._on_global_scale_press())
+        gscale.bind('<ButtonRelease-1>', lambda e: self._on_global_scale_release())
+        ttk.Label(gframe, textvariable=self.global_time_var, width=24,
+                  anchor='w').pack(side=tk.LEFT, padx=(4, 0))
+
+        ttk.Label(
+            top,
+            text="把两个视频分别拖入左右区域（或点击区域选择文件）；两列属性按相同行对齐，点击任一属性行可在左右两侧同步高亮对比。",
+            foreground="gray").pack(side=tk.LEFT)
+        self.video_settings_btn = ttk.Button(
+            top, text="⚙ 播放器设置", command=self._open_player_settings)
+        self.video_settings_btn.pack(side=tk.RIGHT, padx=4)
+        self.video_pick_btn = ttk.Button(
+            top, text="📁 文件选择", command=self._open_video_folder_window)
+        self.video_pick_btn.pack(side=tk.RIGHT, padx=4)
+        self.video_play_check_btn = ttk.Button(
+            top, text="▶ 播放检查", command=self._toggle_play_check)
+        self.video_play_check_btn.pack(side=tk.RIGHT, padx=4)
+        self.video_stop_btn = ttk.Button(
+            top, text="⏹ 全部停止", command=self._stop_all_players)
+        self.video_stop_btn.pack(side=tk.RIGHT, padx=4)
+        self.video_clear_btn = ttk.Button(
+            top, text="🗑 清空", command=self._clear_video_compare)
+        self.video_clear_btn.pack(side=tk.RIGHT, padx=4)
+
+        player_cls = self._get_embedded_player_class()
+        self.video_sides = {}
+
+        # ---------- 左右两个对称区域 ----------
+        for idx, side in enumerate(('A', 'B')):
+            title = "视频 A（左）" if side == 'A' else "视频 B（右）"
+            frame = ttk.LabelFrame(parent, text=title, padding=4)
+            frame.grid(row=2, column=idx, sticky="nsew",
+                       padx=(4, 2) if idx == 0 else (2, 4), pady=2)
+            frame.columnconfigure(0, weight=1)
+            frame.rowconfigure(2, weight=1, minsize=160)
+
+            # 拖放区（也可点击选择文件）
+            drop = tk.Label(
+                frame, text="⬇ 将视频文件拖到这里\n（或点击此处选择文件）",
+                relief=tk.GROOVE, bd=2, bg="#eef4fb", fg="#334455",
+                height=2, cursor="hand2", justify="center")
+            drop.grid(row=0, column=0, sticky="ew", padx=2, pady=(2, 2))
+            drop.bind('<Button-1>', lambda e, s=side: self._browse_video_side(s))
+
+            name_var = tk.StringVar(value="（未选择文件）")
+            # 文件名改为可编辑文本框，右侧“更名”按钮按文本框内容改名
+            name_frame = ttk.Frame(frame)
+            name_frame.grid(row=1, column=0, sticky="ew", padx=2)
+            name_frame.columnconfigure(0, weight=1)
+            name_entry = ttk.Entry(name_frame, textvariable=name_var)
+            name_entry.grid(row=0, column=0, sticky="ew")
+            ttk.Button(
+                name_frame, text="更名", width=6,
+                command=lambda s=side: self._rename_video_side(s)).grid(
+                    row=0, column=1, padx=(4, 0))
+
+            # 播放器容器（首帧即缩略图，播放时同样在此渲染，自动适配尺寸）
+            holder = ttk.Frame(frame, height=180)
+            holder.grid(row=2, column=0, sticky="nsew", padx=2, pady=2)
+            holder.pack_propagate(False)
+
+            player = None
+            if player_cls is not None:
+                try:
+                    player = player_cls(
+                        holder,
+                        on_time=lambda t, s=side: self._on_video_time(s, t),
+                        on_state=lambda st, s=side: self._on_video_state(s, st))
+                except Exception as e:
+                    self.log(f"[视频文件比对] 创建内嵌播放器失败: {e}")
+            if player is None:
+                ttk.Label(holder, text="内嵌播放器不可用\n（缺少 opencv / Pillow）",
+                          foreground="red", justify="center").pack(expand=True)
+
+            # 可拖动进度条（0~1，按视频时长映射）
+            scale_var = tk.DoubleVar(value=0.0)
+            scale = ttk.Scale(frame, from_=0.0, to=1.0,
+                              variable=scale_var, orient=tk.HORIZONTAL)
+            scale.grid(row=3, column=0, sticky="ew", padx=2)
+            scale.configure(command=lambda v, s=side: self._on_scale_move(s, v))
+            scale.bind('<ButtonPress-1>', lambda e, s=side: self._on_scale_press(s))
+            scale.bind('<ButtonRelease-1>', lambda e, s=side: self._on_scale_release(s))
+
+            # 时间 + 单独播放 / VLC 原尺寸
+            ctrl = ttk.Frame(frame)
+            ctrl.grid(row=4, column=0, sticky="ew", padx=2, pady=(2, 2))
+            time_var = tk.StringVar(value="00:00:00 / 00:00:00")
+            ttk.Label(ctrl, textvariable=time_var).pack(side=tk.LEFT)
+            play_btn = ttk.Button(ctrl, text="▶ 播放", width=8,
+                                  command=lambda s=side: self._toggle_side_play(s))
+            play_btn.pack(side=tk.RIGHT, padx=2)
+            ttk.Button(ctrl, text="删除视频",
+                       command=lambda s=side: self._delete_video_side(s)).pack(
+                           side=tk.RIGHT, padx=2)
+            ttk.Button(ctrl, text="VLC 原尺寸",
+                       command=lambda s=side: self._open_side_in_vlc(s)).pack(
+                           side=tk.RIGHT, padx=2)
+
+            # 属性列表（两侧行顺序完全一致，天然对齐）
+            # selectmode='none'：不用系统“当前焦点”选中样式，改用自定义 tag 高亮，
+            # 这样左右两列能显示完全相同的激活样式（系统选中样式只在获得焦点的一侧显示）。
+            info = ttk.Treeview(frame, columns=('attr', 'value'),
+                                show='headings', height=10, selectmode='none')
+            info.heading('attr', text='属性')
+            info.heading('value', text='值')
+            info.column('attr', width=84, minwidth=70, anchor='w', stretch=False)
+            info.column('value', width=220, minwidth=120, anchor='w', stretch=True)
+            info.tag_configure('active', background='#2a7fd4', foreground='white')
+            info.grid(row=5, column=0, sticky='ew', padx=2, pady=(0, 2))
+            info.bind('<Button-1>', lambda e, s=side: self._on_info_click(e, s))
+            for key, label in self.VIDEO_INFO_FIELDS:
+                info.insert('', tk.END, iid=key, values=(label, ''))
+
+            self.video_sides[side] = {
+                'path': None,
+                'player': player,
+                'play_btn': play_btn,
+                'scale': scale,
+                'scale_var': scale_var,
+                'time_var': time_var,
+                'name_var': name_var,
+                'info': info,
+                'drop': drop,
+                'duration': 0.0,
+                'updating_scale': False,
+                'dragging': False,
+                'was_playing': False,
+                'gen': 0,
+            }
+
+            # 等主窗口就绪后再注册拖放（tkdnd 需要主窗口已创建）
+            self.frame.after(350, lambda w=drop, s=side: self._register_video_drop(w, s))
+
+    # ---------- 拖放 ----------
+    def _register_video_drop(self, widget, side: str) -> bool:
+        """把拖放区注册为 tkdnd 拖放目标（接收资源管理器拖入的文件）"""
+        try:
+            from tkinterdnd2 import TkinterDnD, DND_FILES
+            root = widget.winfo_toplevel()
+            if not getattr(root, '_tkdnd_required', False):
+                TkinterDnD._require(root)
+                root._tkdnd_required = True
+            widget.drop_target_register(DND_FILES)
+            widget.dnd_bind('<<Drop>>', lambda e, s=side: self._on_video_drop(e, s))
+            widget.dnd_bind('<<DragEnter>>',
+                            lambda e, s=side: self._set_drop_zone_active(s, True))
+            widget.dnd_bind('<<DragLeave>>',
+                            lambda e, s=side: self._set_drop_zone_active(s, False))
+            return True
+        except Exception as e:
+            self.log(f"[视频文件比对] 拖放注册失败: {e}")
+            return False
+
+    def _set_drop_zone_active(self, side: str, active: bool):
+        st = self.video_sides.get(side)
+        if not st:
+            return
+        try:
+            st['drop'].configure(bg="#cfe6ff" if active else "#eef4fb")
+        except Exception:
+            pass
+
+    def _on_video_drop(self, event, side: str):
+        """处理拖入：取第一个有效的视频文件载入对应区域"""
+        self._set_drop_zone_active(side, False)
+        try:
+            paths = list(self.frame.tk.splitlist(event.data))
+        except Exception:
+            paths = [str(getattr(event, 'data', ''))]
+        for p in paths:
+            if p and os.path.isfile(p):
+                self._load_video_side(side, p)
+                break
+        return getattr(event, 'action', None)
+
+    def _browse_video_side(self, side: str):
+        exts = ' '.join(f"*{e}" for e in sorted(self.VIDEO_EXTENSIONS))
+        path = filedialog.askopenfilename(
+            title=f"选择视频 {side}",
+            filetypes=[("视频文件", exts), ("所有文件", "*.*")])
+        if path:
+            self._load_video_side(side, path)
+
+    # ---------- 载入 / 属性读取 ----------
+    def _load_video_side(self, side: str, path: str):
+        st = self.video_sides.get(side)
+        if not st:
+            return
+        ext = Path(path).suffix.lower()
+        if ext not in self.VIDEO_EXTENSIONS:
+            self.show_toast(f"不支持的文件类型: {ext or '未知'}", "warning")
+            return
+        if not os.path.isfile(path):
+            self.show_toast("文件不存在或无法访问", "warning")
+            return
+
+        st['gen'] += 1
+        gen = st['gen']
+        st['path'] = path
+        st['name_var'].set(Path(path).name)
+        st['duration'] = 0.0
+        st['dragging'] = False
+        st['was_playing'] = False
+        st['updating_scale'] = True
+        try:
+            st['scale_var'].set(0.0)
+        finally:
+            st['updating_scale'] = False
+        st['time_var'].set("读取中…")
+        self._clear_info_highlight()
+        for key, _label in self.VIDEO_INFO_FIELDS:
+            try:
+                st['info'].set(key, 'value', '')
+            except Exception:
+                pass
+
+        # 换文件时先释放旧播放器，避免继续读取旧文件
+        if st['player'] is not None:
+            try:
+                st['player'].release()
+            except Exception:
+                pass
+
+        threading.Thread(
+            target=self._probe_video_info_thread,
+            args=(side, path, gen), daemon=True).start()
+        # 主线程轮询后台结果（跨线程直接调用 after 在部分环境不可靠）
+        self.frame.after(60, lambda: self._poll_video_probe(side, gen))
+
+    def _probe_video_info_thread(self, side: str, path: str, gen: int):
+        try:
+            info = self._probe_video_info(path)
+        except Exception as e:
+            self.log(f"[视频文件比对] 读取视频信息失败: {path} - {e}")
+            info = {}
+        # 只写入缓存，由主线程 _poll_video_probe 取用并刷新界面
+        self.video_probe_results[(side, gen)] = (path, info)
+
+    def _poll_video_probe(self, side: str, gen: int):
+        """主线程轮询：后台读取完成后刷新属性表并加载播放器"""
+        st = self.video_sides.get(side)
+        if not st or st['gen'] != gen:
+            self.video_probe_results.pop((side, gen), None)
+            return
+        item = self.video_probe_results.pop((side, gen), None)
+        if item is None:
+            self.frame.after(60, lambda: self._poll_video_probe(side, gen))
+            return
+        path, info = item
+        self._apply_video_info(side, path, info, gen)
+
+    def _resolve_ffprobe(self) -> str:
+        cached = getattr(self, '_ffprobe_path', None)
+        if cached is not None:
+            return cached
+        fp = shutil.which('ffprobe') or ''
+        self._ffprobe_path = fp
+        return fp
+
+    def _probe_video_info(self, path: str) -> Dict:
+        """读取视频全部展示属性（ffprobe 优先，OpenCV / 估算兜底）"""
+        p = Path(path)
+        info: Dict = {'path': str(p), 'name': p.name}
+        try:
+            st = p.stat()
+            info['size'] = st.st_size
+            info['modified'] = st.st_mtime
+        except Exception:
+            info['size'] = 0
+            info['modified'] = 0
+        info['location'] = str(p.parent)
+        try:
+            info['type'] = shell_file_type_name(str(p)) or self._fallback_file_type(p)
+        except Exception:
+            info['type'] = self._fallback_file_type(p)
+
+        dur = w = h = fps = vbr = tbr = 0.0
+        fp = self._resolve_ffprobe()
+        if fp:
+            flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0) if os.name == 'nt' else 0
+            try:
+                res = subprocess.run(
+                    [fp, '-v', 'error', '-show_entries',
+                     'format=duration,bit_rate:'
+                     'stream=codec_type,width,height,r_frame_rate,avg_frame_rate,bit_rate',
+                     '-of', 'json', path],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    text=True, timeout=30, creationflags=flags)
+                data = json.loads(res.stdout or '{}')
+                fmt = data.get('format', {}) or {}
+                try:
+                    dur = float(fmt.get('duration') or 0)
+                except Exception:
+                    dur = 0.0
+                try:
+                    tbr = float(fmt.get('bit_rate') or 0)
+                except Exception:
+                    tbr = 0.0
+                for s in data.get('streams', []) or []:
+                    if s.get('codec_type') != 'video' or w:
+                        continue
+                    w = int(s.get('width') or 0)
+                    h = int(s.get('height') or 0)
+                    rate = s.get('r_frame_rate') or s.get('avg_frame_rate') or '0/1'
+                    num, _, den = str(rate).partition('/')
+                    try:
+                        fps = float(num) / float(den or 1)
+                    except Exception:
+                        fps = 0.0
+                    br = str(s.get('bit_rate') or '')
+                    if br.isdigit():
+                        vbr = float(br)
+            except Exception as e:
+                self.log(f"[视频文件比对] ffprobe 读取失败: {p.name} - {e}")
+
+        # OpenCV 兜底：补齐宽高 / 帧率 / 时长
+        if dur <= 0 or w <= 0 or fps <= 0:
+            try:
+                import cv2
+                cap = cv2.VideoCapture(str(p))
+                if cap.isOpened():
+                    if w <= 0:
+                        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+                    if h <= 0:
+                        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+                    cap_fps = cap.get(cv2.CAP_PROP_FPS) or 0
+                    if fps <= 0:
+                        fps = cap_fps
+                    frames = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+                    if dur <= 0 and cap_fps > 0 and frames > 0:
+                        dur = frames / cap_fps
+                    cap.release()
+            except Exception:
+                pass
+
+        # 码率兜底：缺失时按 文件大小/时长 估算
+        if vbr <= 0 and dur > 0 and info['size'] > 0:
+            vbr = info['size'] * 8 / dur
+        if tbr <= 0 and dur > 0 and info['size'] > 0:
+            tbr = info['size'] * 8 / dur
+
+        info.update(duration=dur, width=int(w or 0), height=int(h or 0),
+                    fps=float(fps or 0), video_bitrate=float(vbr or 0),
+                    total_bitrate=float(tbr or 0))
+        return info
+
+    def _apply_video_info(self, side: str, path: str, info: Dict, gen: int):
+        """主线程：刷新属性表并载入播放器（首帧即缩略图）"""
+        st = self.video_sides.get(side)
+        if not st or st['gen'] != gen:
+            return
+        if info:
+            self._fill_video_info(st, info)
+
+        player = st['player']
+        duration = float(info.get('duration') or 0)
+        if player is not None:
+            try:
+                if player.load(path):
+                    pd = float(getattr(player, 'duration', 0) or 0)
+                    if pd > 0:
+                        duration = pd
+                else:
+                    self.show_toast("该视频无法用内嵌播放器解码，仍可查看属性", "warning")
+            except Exception as e:
+                self.log(f"[视频文件比对] 播放器加载失败: {e}")
+
+        st['duration'] = duration
+        st['updating_scale'] = True
+        try:
+            st['scale_var'].set(0.0)
+        finally:
+            st['updating_scale'] = False
+        st['time_var'].set(f"00:00:00 / {self._format_hms(duration)}")
+        self.log(f"[视频文件比对] 已载入 {side}: {Path(path).name}")
+        self._update_global_scale()
+
+    def _fill_video_info(self, st: Dict, info: Dict):
+        """把属性字典写入 Treeview（行 iid 即属性 key）"""
+        def put(key, value):
+            try:
+                st['info'].set(key, 'value', value)
+            except Exception:
+                pass
+
+        put('type', info.get('type') or '')
+        put('size', format_file_size(info.get('size') or 0))
+        put('location', info.get('location') or '')
+        put('modified', format_timestamp(info.get('modified') or 0))
+        put('duration', self._format_hms(info.get('duration') or 0))
+        w = int(info.get('width') or 0)
+        h = int(info.get('height') or 0)
+        put('width', str(w) if w else '')
+        put('height', str(h) if h else '')
+        fps = float(info.get('fps') or 0)
+        put('fps', f"{fps:.2f} 帧/秒" if fps else '')
+        vbr = float(info.get('video_bitrate') or 0)
+        put('data_rate', f"{int(round(vbr / 1000))}kbps" if vbr else '')
+        tbr = float(info.get('total_bitrate') or 0)
+        put('total_bitrate', f"{int(round(tbr / 1000))}kbps" if tbr else '')
+
+    def _on_info_click(self, event, side: str):
+        """点击任一侧属性行：左右两列同时高亮同一属性，便于逐项对比"""
+        st = self.video_sides.get(side)
+        if not st:
+            return
+        iid = st['info'].identify_row(event.y)
+        # 点中表头/分隔线时 identify_row 返回空，忽略
+        if not iid:
+            return
+        self._highlight_info_row(iid)
+
+    def _highlight_info_row(self, key: str):
+        """在左右两个属性列表中以相同样式高亮同一属性行（key 即行 iid）"""
+        for st in self.video_sides.values():
+            tree = st.get('info')
+            if tree is None:
+                continue
+            for iid in tree.get_children():
+                tags = tree.item(iid, 'tags') or ()
+                if iid == key:
+                    tree.item(iid, tags=('active',))
+                elif 'active' in tags:
+                    tree.item(iid, tags=())
+            # 两侧同步滚动到该行，保证同一属性都在可视区域内
+            try:
+                tree.see(key)
+            except Exception:
+                pass
+
+    def _clear_info_highlight(self):
+        """清除左右两侧属性列表的激活行"""
+        for st in getattr(self, 'video_sides', {}).values():
+            tree = st.get('info')
+            if tree is None:
+                continue
+            for iid in tree.get_children():
+                tags = tree.item(iid, 'tags') or ()
+                if 'active' in tags:
+                    tree.item(iid, tags=())
+
+    @staticmethod
+    def _format_hms(seconds) -> str:
+        """秒 -> HH:MM:SS"""
+        try:
+            seconds = float(seconds)
+        except Exception:
+            seconds = 0.0
+        if seconds < 0:
+            seconds = 0.0
+        total = int(seconds)
+        return f"{total // 3600:02d}:{(total % 3600) // 60:02d}:{total % 60:02d}"
+
+    # ---------- 播放控制 ----------
+    def _on_video_time(self, side: str, t: float):
+        st = self.video_sides.get(side)
+        if not st:
+            return
+        player = st['player']
+        dur = float(getattr(player, 'duration', 0) or 0) or float(st.get('duration') or 0)
+        if dur <= 0:
+            return
+        st['updating_scale'] = True
+        try:
+            st['scale_var'].set(max(0.0, min(1.0, float(t) / dur)))
+        finally:
+            st['updating_scale'] = False
+        st['time_var'].set(f"{self._format_hms(t)} / {self._format_hms(dur)}")
+        if not getattr(self, 'global_dragging', False):
+            self._update_global_scale()
+
+    def _on_video_state(self, side: str, playing: bool):
+        st = self.video_sides.get(side)
+        if not st:
+            return
+        try:
+            st['play_btn'].configure(text="⏸ 暂停" if playing else "▶ 播放")
+        except Exception:
+            pass
+        self._sync_play_check_button()
+
+    def _sync_play_check_button(self):
+        players = [st['player'] for st in getattr(self, 'video_sides', {}).values()
+                   if st.get('player') is not None]
+        playing = any(getattr(p, 'playing', False) for p in players)
+        try:
+            self.video_play_check_btn.configure(
+                text="⏸ 暂停检查" if playing else "▶ 播放检查")
+        except Exception:
+            pass
+
+    def _on_scale_press(self, side: str):
+        st = self.video_sides.get(side)
+        if not st:
+            return
+        st['dragging'] = True
+        player = st['player']
+        st['was_playing'] = bool(player and player.playing)
+        if player and player.playing:
+            player.pause()
+
+    def _on_scale_move(self, side: str, value):
+        st = self.video_sides.get(side)
+        if not st or st.get('updating_scale'):
+            return
+        dur = float(st.get('duration') or 0)
+        if dur <= 0:
+            return
+        try:
+            t = float(value) * dur
+        except Exception:
+            return
+        # 拖动过程中只更新时间预览，松手后再真正 seek（避免频繁解码卡顿）
+        st['time_var'].set(f"{self._format_hms(t)} / {self._format_hms(dur)}")
+
+    def _on_scale_release(self, side: str):
+        st = self.video_sides.get(side)
+        if not st:
+            return
+        st['dragging'] = False
+        player = st['player']
+        dur = float(st.get('duration') or 0)
+        if player is None or dur <= 0:
+            return
+        try:
+            t = float(st['scale_var'].get()) * dur
+        except Exception:
+            return
+        player.seek(t)   # seek 内部会暂停
+        if st.get('was_playing'):
+            player.play()
+        st['was_playing'] = False
+
+    # ---------- 全局同步进度条 ----------
+    def _get_min_duration(self) -> float:
+        ds = [float(st.get('duration') or 0) for st in self.video_sides.values()
+              if st.get('player') and st['player'].cap is not None
+              and float(st.get('duration') or 0) > 0]
+        return min(ds) if ds else 0.0
+
+    def _update_global_scale(self):
+        """根据两视频中较短的时长刷新同步进度条（参考侧取时长最短的一侧）"""
+        if not hasattr(self, 'global_scale_var'):
+            return
+        loaded = [(s, st) for s, st in self.video_sides.items()
+                  if st.get('player') and st['player'].cap is not None
+                  and float(st.get('duration') or 0) > 0]
+        if not loaded:
+            self.global_updating = True
+            try:
+                self.global_scale_var.set(0.0)
+            finally:
+                self.global_updating = False
+            self.global_time_var.set("00:00:00 / 00:00:00")
+            return
+        min_dur = min(float(st['duration']) for _, st in loaded)
+        ref = min(loaded, key=lambda x: float(x[1]['duration']))[1]
+        pos = float(getattr(ref['player'], 'current_time', 0) or 0)
+        if pos > min_dur:
+            pos = min_dur
+        self.global_updating = True
+        try:
+            self.global_scale_var.set(pos / min_dur if min_dur > 0 else 0.0)
+        finally:
+            self.global_updating = False
+        self.global_time_var.set(
+            f"{self._format_hms(pos)} / {self._format_hms(min_dur)}")
+
+    def _on_global_scale_move(self, value):
+        if getattr(self, 'global_updating', False):
+            return
+        min_dur = self._get_min_duration()
+        if min_dur <= 0:
+            return
+        t = float(value) * min_dur
+        self.global_time_var.set(
+            f"{self._format_hms(t)} / {self._format_hms(min_dur)}")
+
+    def _on_global_scale_press(self):
+        self.global_dragging = True
+        self.global_was_playing = {}
+        for side, st in self.video_sides.items():
+            p = st.get('player')
+            if p and p.cap is not None:
+                playing = bool(p.playing)
+                self.global_was_playing[side] = playing
+                if playing:
+                    p.pause()
+
+    def _on_global_scale_release(self):
+        """松手后按同一秒数同时定位左右两区（以较短时长为上限）"""
+        self.global_dragging = False
+        min_dur = self._get_min_duration()
+        if min_dur <= 0:
+            return
+        try:
+            value = float(self.global_scale_var.get())
+        except Exception:
+            return
+        t = value * min_dur
+        for side, st in self.video_sides.items():
+            p = st.get('player')
+            if p and p.cap is not None:
+                p.seek(t)   # seek 内部会暂停
+                if self.global_was_playing.get(side):
+                    p.play()
+        self._update_global_scale()
+
+    def _toggle_side_play(self, side: str):
+        st = self.video_sides.get(side)
+        if not st or st['player'] is None or st['player'].cap is None:
+            self.show_toast("请先在对应区域放入可播放的视频文件", "warning")
+            return
+        player = st['player']
+        if player.playing:
+            player.pause()
+        else:
+            dur = float(getattr(player, 'duration', 0) or 0)
+            if dur > 0 and player.current_time >= dur - 0.05:
+                player.seek(0.0)
+            player.play()
+
+    def _toggle_play_check(self):
+        """同时播放/暂停左右两个播放器（播放检查）"""
+        players = [st['player'] for st in self.video_sides.values()
+                   if st.get('player') is not None and st['player'].cap is not None]
+        if len(players) < 2:
+            self.show_toast("请先在左右两侧各放入一个视频文件", "warning")
+            return
+        if any(p.playing for p in players):
+            for p in players:
+                p.pause()
+            self.video_play_check_btn.configure(text="▶ 播放检查")
+            return
+        for p in players:
+            dur = float(getattr(p, 'duration', 0) or 0)
+            if dur > 0 and p.current_time >= dur - 0.05:
+                p.seek(0.0)
+            p.play()
+        self.video_play_check_btn.configure(text="⏸ 暂停检查")
+
+    def _stop_all_players(self):
+        for st in self.video_sides.values():
+            p = st.get('player')
+            if p is None:
+                continue
+            try:
+                p.pause()
+                if p.cap is not None:
+                    p.seek(0.0)
+            except Exception:
+                pass
+        try:
+            self.video_play_check_btn.configure(text="▶ 播放检查")
+        except Exception:
+            pass
+
+    def _reset_video_side(self, side: str):
+        """复位单个视频区域：释放播放器句柄、清空显示与缓存（不清空文件名文本框占位）"""
+        st = self.video_sides.get(side)
+        if not st:
+            return
+        player = st['player']
+        if player is not None:
+            try:
+                player.pause()
+                player.release()          # 关闭 cv2 句柄，解除文件占用
+                if hasattr(player, '_canvas'):
+                    player._canvas.delete('all')
+            except Exception:
+                pass
+        st['path'] = None
+        st['gen'] += 1                   # 让任何在途的探测结果作废
+        st['duration'] = 0.0
+        st['dragging'] = False
+        st['was_playing'] = False
+        st['updating_scale'] = True
+        try:
+            st['scale_var'].set(0.0)
+        finally:
+            st['updating_scale'] = False
+        st['time_var'].set("00:00:00 / 00:00:00")
+        st['name_var'].set("（未选择文件）")
+        try:
+            st['drop'].configure(bg="#eef4fb")
+        except Exception:
+            pass
+        for key, _label in self.VIDEO_INFO_FIELDS:
+            try:
+                st['info'].set(key, 'value', '')
+            except Exception:
+                pass
+        for k in list(self.video_probe_results.keys()):
+            if k[0] == side:
+                self.video_probe_results.pop(k, None)
+        self._clear_info_highlight()
+        self._update_global_scale()
+
+    def _clear_video_compare(self):
+        """清空左右两个视频对比区（释放句柄、复位界面），供“清空”按钮调用"""
+        self._reset_video_side('A')
+        self._reset_video_side('B')
+        try:
+            self.video_play_check_btn.configure(text="▶ 播放检查")
+        except Exception:
+            pass
+        self.log("[视频文件比对] 已清空左右两个视频对比区")
+
+    def _rename_video_side(self, side: str):
+        """按文件名文本框内容对当前视频重命名；目标已存在时让用户选择覆盖或追加数字后缀"""
+        st = self.video_sides.get(side)
+        if not st:
+            return
+        path = st.get('path')
+        if not path or not os.path.isfile(path):
+            self.show_toast("请先在该区域放入视频文件", "warning")
+            return
+        new_name = (st['name_var'].get() or '').strip()
+        if not new_name:
+            self.show_toast("文件名不能为空", "warning")
+            return
+        cur = Path(path)
+        parent = cur.parent
+        # 用户输入不含扩展名时，保留原扩展名
+        if Path(new_name).suffix == '' and cur.suffix:
+            new_name = new_name + cur.suffix
+        target = parent / new_name
+        if target.resolve() == cur.resolve():
+            self.show_toast("文件名未发生变化", "info")
+            return
+        if target.exists():
+            choice = messagebox.askyesnocancel(
+                "文件名已存在",
+                f"目标文件已存在：\n{new_name}\n\n“是”=覆盖原文件；“否”=追加数字后缀；“取消”=不操作")
+            if choice is None:
+                return
+            if choice is True:                # 覆盖
+                try:
+                    os.remove(target)
+                except Exception as e:
+                    self.show_toast(f"无法覆盖：{e}", "error")
+                    return
+            else:                             # 追加数字后缀
+                base = target.stem
+                ext = target.suffix
+                i = 1
+                while True:
+                    cand = parent / f"{base}_{i}{ext}"
+                    if not cand.exists():
+                        target = cand
+                        break
+                    i += 1
+        # 先释放句柄再改名，避免 Windows 下占用导致失败；改名后重新载入播放器
+        try:
+            if st['player'] is not None:
+                st['player'].release()
+            os.rename(cur, target)
+            st['path'] = str(target)
+            st['name_var'].set(target.name)
+            self.log(f"[视频文件比对] 已重命名: {cur.name} -> {target.name}")
+            self.show_toast(f"已重命名：{target.name}", "success")
+            win = getattr(self, '_folder_pick_window', None)
+            if win is not None and win.winfo_exists():
+                win.mark_renamed(str(cur), str(target))
+            if st['player'] is not None:
+                st['player'].load(str(target))
+                st['scale_var'].set(0.0)
+                st['time_var'].set(f"00:00:00 / {self._format_hms(st['duration'])}")
+        except Exception as e:
+            self.show_toast(f"重命名失败：{e}", "error")
+
+    def _delete_video_side(self, side: str):
+        """删除当前区域的视频文件（带确认提示），并复位该区域"""
+        st = self.video_sides.get(side)
+        if not st:
+            return
+        path = st.get('path')
+        if not path or not os.path.isfile(path):
+            self.show_toast("请先在该区域放入视频文件", "warning")
+            return
+        name = Path(path).name
+        if not messagebox.askyesno(
+                "删除确认", f"确定要删除该视频文件吗？\n\n{name}\n\n此操作不可撤销。"):
+            return
+        try:
+            if st['player'] is not None:
+                st['player'].release()      # 释放句柄后才能删除
+            os.remove(path)
+            self.log(f"[视频文件比对] 已删除视频: {path}")
+            self.show_toast(f"已删除：{name}", "success")
+            win = getattr(self, '_folder_pick_window', None)
+            if win is not None and win.winfo_exists():
+                win.mark_removed(path)
+            self._reset_video_side(side)
+        except Exception as e:
+            self.show_toast(f"删除失败：{e}", "error")
+
+    # ---------- VLC 原尺寸播放 ----------
+    def _open_player_settings(self):
+        """播放器设置：指定 VLC 可执行文件路径（用于“VLC 原尺寸”播放），留空则自动查找"""
+        win = getattr(self, '_player_settings_win', None)
+        if win is not None and win.winfo_exists():
+            win.lift()
+            win.focus_force()
+            return
+        root = self.frame.winfo_toplevel()
+        win = tk.Toplevel(root)
+        self._player_settings_win = win
+        win.title("播放器设置")
+        win.transient(root)
+        win.resizable(False, False)
+
+        f = ttk.Frame(win, padding=12)
+        f.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(f, text="VLC 播放器路径：").grid(
+            row=0, column=0, sticky='w', pady=(0, 4))
+        var = tk.StringVar(value=self._find_vlc() or '')
+        ttk.Entry(f, textvariable=var, width=52).grid(
+            row=1, column=0, columnspan=2, sticky='ew', padx=(0, 4))
+
+        def browse():
+            p = filedialog.askopenfilename(
+                title="选择 VLC 可执行文件",
+                filetypes=[("VLC 可执行文件", "vlc.exe"), ("所有文件", "*.*")])
+            if p:
+                var.set(p)
+
+        ttk.Button(f, text="浏览...", command=browse).grid(
+            row=1, column=2, padx=(4, 0))
+        ttk.Label(f, text="留空则自动在常见安装路径中查找 VLC",
+                  foreground="gray").grid(
+            row=2, column=0, columnspan=3, sticky='w', pady=(2, 10))
+
+        def save():
+            path = var.get().strip()
+            if path and not os.path.isfile(path):
+                self.show_toast("该路径不是有效的文件", "warning")
+                return
+            self._vlc_path = path
+            self._save_config()
+            self.show_toast("播放器设置已保存", "success")
+            win.destroy()
+
+        ttk.Button(f, text="确定", command=save).grid(
+            row=3, column=1, padx=4, pady=2)
+        ttk.Button(f, text="取消", command=win.destroy).grid(
+            row=3, column=2, padx=4, pady=2)
+
+        win.update_idletasks()
+        rw, rh = root.winfo_width(), root.winfo_height()
+        rx, ry = root.winfo_rootx(), root.winfo_rooty()
+        w, h = win.winfo_width(), win.winfo_height()
+        win.geometry(f"+{rx + max(0, (rw - w) // 2)}+{ry + max(0, (rh - h) // 2)}")
+
+    def _find_vlc(self) -> str:
+        cached = getattr(self, '_vlc_path', None)
+        if cached and os.path.isfile(cached):
+            return cached
+        candidates = []
+        w = shutil.which('vlc')
+        if w:
+            candidates.append(w)
+        for base in (os.environ.get('ProgramFiles'),
+                     os.environ.get('ProgramFiles(x86)'),
+                     os.environ.get('ProgramW6432')):
+            if base:
+                candidates.append(os.path.join(base, 'VideoLAN', 'VLC', 'vlc.exe'))
+        found = next((c for c in candidates if c and os.path.isfile(c)), '')
+        self._vlc_path = found
+        return found
+
+    def _open_side_in_vlc(self, side: str):
+        """用独立 VLC 播放器以原始尺寸播放该侧视频（找不到 VLC 时回退默认播放器）"""
+        st = self.video_sides.get(side)
+        path = st.get('path') if st else None
+        if not path or not os.path.isfile(path):
+            self.show_toast("请先在对应区域放入视频文件", "warning")
+            return
+        try:
+            vlc = self._find_vlc()
+            if vlc:
+                subprocess.Popen([vlc, path])
+                self.log(f"[视频文件比对] 已用 VLC 原尺寸打开: {path}")
+                self.show_toast("已用 VLC 打开视频", "success")
+            else:
+                if hasattr(os, 'startfile'):
+                    os.startfile(path)
+                else:
+                    subprocess.Popen(['xdg-open', path])
+                self.show_toast("未找到 VLC，已用系统默认播放器打开", "info")
+        except Exception as e:
+            self.show_toast(f"打开失败: {e}", "error")
+
+
+    def _open_video_folder_window(self):
+        """打开“文件夹选择”窗口；若之前关闭过，则恢复其内容、文件夹与滚动位置"""
+        win = getattr(self, '_folder_pick_window', None)
+        if win is not None and win.winfo_exists():
+            win.deiconify()
+            win.restore_scroll_positions()
+            win.lift()
+            win.focus_force()
+            return
+        self._folder_pick_window = VideoFolderPickWindow(self)
+
+
+class VideoFolderPickWindow(tk.Toplevel):
+    """文件夹选择窗口：左右两栏分别选择文件夹，以缩略图列出媒体文件，
+    双击缩略图将文件加入主界面视频比对的对应（左=A，右=B）区域。"""
+
+    THUMB_SIZES = [64, 96, 128, 160, 200]
+
+    def __init__(self, parent):
+        root = parent.frame.winfo_toplevel()
+        super().__init__(root)
+        self.parent = parent
+        self.title("选择文件夹中的视频进行对比")
+        self._state = {}
+        self._content_hidden = False
+        self.size_var = tk.StringVar(value="128")
+        self._build()
+        self.transient(root)
+        self._center()
+        self.lift()
+        # 关闭只隐藏，保留已读取的文件夹、缩略图与滚动位置，下次打开可恢复
+        self.protocol("WM_DELETE_WINDOW", self._hide_window)
+
+    def _build(self):
+        top = ttk.Frame(self)
+        top.pack(fill=tk.X, padx=8, pady=6)
+        ttk.Label(top, text="缩略图尺寸:").pack(side=tk.LEFT)
+        cb = ttk.Combobox(top, textvariable=self.size_var, width=6,
+                          values=[str(s) for s in self.THUMB_SIZES],
+                          state="readonly")
+        cb.pack(side=tk.LEFT, padx=4)
+        cb.bind("<<ComboboxSelected>>", lambda e: self._reload_all())
+        ttk.Label(top, text="双击缩略图可加入对应侧的视频对比区").pack(side=tk.LEFT, padx=10)
+        self.close_btn = ttk.Button(top, text="关闭窗口", command=self._hide_window)
+        self.close_btn.pack(side=tk.RIGHT, padx=(4, 0))
+        self.hide_btn = ttk.Button(top, text="隐藏内容", command=self._toggle_hide_content)
+        self.hide_btn.pack(side=tk.RIGHT, padx=4)
+
+        body = ttk.Frame(self)
+        body.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+        body.columnconfigure(0, weight=1)
+        body.columnconfigure(1, weight=1)
+        body.rowconfigure(0, weight=1)
+        self._state['left'] = self._build_panel(body, 'left', 0)
+        self._state['right'] = self._build_panel(body, 'right', 1)
+
+    def _build_panel(self, body, side, col):
+        title = "左侧文件夹（双击加入 A 区）" if side == 'left' else "右侧文件夹（双击加入 B 区）"
+        outer = ttk.LabelFrame(body, text=title)
+        outer.grid(row=0, column=col, sticky="nsew", padx=4)
+        frow = ttk.Frame(outer)
+        frow.pack(fill=tk.X, padx=4, pady=4)
+        pv = tk.StringVar()
+        entry = ttk.Entry(frow, textvariable=pv)
+        entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        entry.bind("<Return>", lambda e, s=side: self._open_folder(s))
+        ttk.Button(frow, text="选择文件夹",
+                   command=lambda s=side: self._pick_folder(s)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(frow, text="打开",
+                   command=lambda s=side: self._open_folder(s)).pack(side=tk.LEFT, padx=2)
+        sv = tk.StringVar(value="未选择文件夹")
+        ttk.Label(outer, textvariable=sv).pack(fill=tk.X, padx=4)
+        canvas = tk.Canvas(outer, bd=0, highlightthickness=0)
+        scroll = ttk.Scrollbar(outer, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=scroll.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(4, 0), pady=4)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y, pady=4)
+        inner = ttk.Frame(canvas)
+        win_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e, s=side: self._on_canvas_configure(s, e))
+        # 老板键隐藏内容时的占位提示（默认不布局）
+        hide_tip = ttk.Label(outer, text="内容已隐藏\n点击“显示内容”恢复",
+                             anchor='center', justify='center',
+                             foreground="#888888")
+        return {'path_var': pv, 'folder': None, 'files': [], 'idx': 0,
+                'photos': [], 'tiles': [], 'fpaths': [], 'labels': [],
+                'canvases': [], 'canvas_items': [], 'loaded': [],
+                'deleted_map': {}, 'done': 0, 'thread_active': False,
+                'load_id': 0, 'result_q': None,
+                'canvas': canvas, 'inner': inner, 'win_id': win_id,
+                'status': sv, 'scroll': scroll, 'hide_tip': hide_tip,
+                'yview': None, 'side': side}
+
+    def _hide_window(self):
+        """关闭窗口只隐藏，保留已读取的文件夹、缩略图与滚动位置"""
+        self._save_scroll_positions()
+        self.withdraw()
+
+    def _save_scroll_positions(self):
+        """记录左右两栏当前滚动位置（内容隐藏时不覆盖已保存值）"""
+        if getattr(self, '_content_hidden', False):
+            return
+        for side in ('left', 'right'):
+            st = self._state.get(side)
+            if not st:
+                continue
+            try:
+                st['yview'] = st['canvas'].yview()
+            except Exception:
+                st['yview'] = None
+
+    def restore_scroll_positions(self):
+        """恢复左右两栏的滚动位置（窗口重新显示后调用）"""
+        self.update_idletasks()
+        for side in ('left', 'right'):
+            st = self._state.get(side)
+            if not st:
+                continue
+            yv = st.get('yview')
+            if not yv:
+                continue
+            try:
+                st['canvas'].yview_moveto(yv[0])
+            except Exception:
+                pass
+
+    def _toggle_hide_content(self):
+        """老板键：一键隐藏/恢复下方两个文件夹显示区域的内容"""
+        hiding = not getattr(self, '_content_hidden', False)
+        if hiding:
+            self._save_scroll_positions()   # 隐藏前先记录滚动位置
+        self._content_hidden = hiding
+        for side in ('left', 'right'):
+            st = self._state.get(side)
+            if not st:
+                continue
+            if hiding:
+                st['canvas'].pack_forget()
+                st['scroll'].pack_forget()
+                st['hide_tip'].pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+            else:
+                st['hide_tip'].pack_forget()
+                st['canvas'].pack(side=tk.LEFT, fill=tk.BOTH, expand=True,
+                                  padx=(4, 0), pady=4)
+                st['scroll'].pack(side=tk.RIGHT, fill=tk.Y, pady=4)
+        self.hide_btn.configure(text="显示内容" if hiding else "隐藏内容")
+        if not hiding:
+            self.update_idletasks()
+            for side in ('left', 'right'):
+                self._reflow(side)
+            self.restore_scroll_positions()
+
+    def _pick_folder(self, side):
+        path = filedialog.askdirectory(title="选择文件夹")
+        if path:
+            self._state[side]['path_var'].set(path)
+            self._open_folder(side)
+
+    def _open_folder(self, side):
+        """读取文件夹并立即铺满占位单元，缩略图由后台线程逐步生成（首屏即时可见）"""
+        st = self._state[side]
+        folder = st['path_var'].get().strip()
+        if not folder or not os.path.isdir(folder):
+            messagebox.showwarning("提示", "文件夹路径无效，请重新选择或粘贴正确路径后点击“打开”。")
+            return
+        st['folder'] = folder
+        st['load_id'] = st.get('load_id', 0) + 1
+        try:
+            names = os.listdir(folder)
+        except Exception as e:
+            messagebox.showerror("错误", f"无法读取文件夹：{e}")
+            return
+        exts = set(self.parent.VIDEO_EXTENSIONS) | set(self.parent.IMAGE_EXTENSIONS)
+        files = sorted(n for n in names
+                       if os.path.isfile(os.path.join(folder, n))
+                       and os.path.splitext(n)[1].lower() in exts)
+        st['files'] = files
+        size = int(self.size_var.get())
+        self._clear_tiles(side)
+        # 立即为所有文件创建占位单元，首屏即时可见（灰色缩略图 + 文件名）
+        for name in files:
+            self._add_tile(side, os.path.join(folder, name), name, size)
+        st['status'].set(f"共 {len(files)} 个媒体文件，正在生成缩略图…")
+        self._reflow(side)
+        if files:
+            self._start_thumb_loader(side)
+
+    def _clear_tiles(self, side):
+        st = self._state[side]
+        st['thread_active'] = False          # 终止可能仍在运行的后台线程
+        for w in list(st['inner'].children.values()):
+            w.destroy()
+        st['photos'] = []
+        st['tiles'] = []
+        st['fpaths'] = []
+        st['labels'] = []
+        st['canvases'] = []
+        st['canvas_items'] = []
+        st['loaded'] = []
+        st['deleted_map'] = {}
+        st['idx'] = 0
+        st['done'] = 0
+        st['status'].set(f"共 {len(st['files'])} 个媒体文件" if st['folder'] else "未选择文件夹")
+
+    def _on_canvas_configure(self, side, event):
+        """画布尺寸变化时，让内容宽度跟随并重新排列缩略图"""
+        st = self._state[side]
+        try:
+            st['canvas'].itemconfigure(st['win_id'], width=event.width)
+        except Exception:
+            pass
+        self._reflow(side)
+
+    def _reflow(self, side):
+        """按当前可用宽度计算列数，将缩略图以网格方式排列（仅竖向滚动）"""
+        st = self._state[side]
+        size = int(self.size_var.get())
+        cell_w = size + 24
+        try:
+            avail = st['canvas'].winfo_width()
+        except Exception:
+            avail = 0
+        if avail <= 1:
+            avail = 640
+        cols = max(1, avail // cell_w)
+        for c in range(cols):
+            st['inner'].columnconfigure(c, minsize=cell_w, weight=1)
+        for i, tile in enumerate(st['tiles']):
+            tile.grid(row=i // cols, column=i % cols, padx=2, pady=6, sticky='n')
+
+    def _start_thumb_loader(self, side):
+        """后台线程生成缩略图（PIL），主线程轮询队列仅做廉价插入，避免卡顿"""
+        import threading, queue
+        st = self._state[side]
+        load_id = st['load_id']
+        folder = st['folder']
+        size = int(self.size_var.get())
+        files = st['files']
+        result_q = queue.Queue()
+        st['result_q'] = result_q
+        st['thread_active'] = True
+        st['done'] = 0
+
+        def worker():
+            for idx, name in enumerate(files):
+                if st['load_id'] != load_id or not st['thread_active']:
+                    return
+                fpath = os.path.join(folder, name)
+                is_video = os.path.splitext(fpath)[1].lower() in self.parent.VIDEO_EXTENSIONS
+                try:
+                    pil = self._compose_thumbnail(fpath, size, is_video)
+                except Exception:
+                    try:
+                        from PIL import Image
+                        pil = Image.new('RGB', (size, size), (70, 74, 82))
+                    except Exception:
+                        pil = None
+                result_q.put((idx, pil))
+
+        threading.Thread(target=worker, daemon=True).start()
+        self._poll_thumb_queue(side, load_id)
+
+    def _poll_thumb_queue(self, side, load_id):
+        st = self._state[side]
+        if st['load_id'] != load_id or not st['files']:
+            return
+        q = st.get('result_q')
+        if q is not None:
+            for _ in range(5):
+                if q.empty():
+                    break
+                try:
+                    idx, pil = q.get_nowait()
+                except Exception:
+                    break
+                self._apply_thumb(side, idx, pil)
+            st['status'].set(f"已生成缩略图 {st['done']}/{len(st['files'])}")
+        if st['thread_active'] or (q is not None and not q.empty()):
+            self.after(40, lambda: self._poll_thumb_queue(side, load_id))
+        else:
+            self._reflow(side)
+            st['status'].set(f"共 {len(st['files'])} 个媒体文件")
+
+    def _apply_thumb(self, side, idx, pil):
+        st = self._state[side]
+        if idx >= len(st['canvases']):
+            return
+        cv = st['canvases'][idx]
+        from PIL import ImageTk
+        try:
+            if pil is not None:
+                photo = ImageTk.PhotoImage(pil)
+                st['photos'][idx] = photo
+            else:
+                photo = st['photos'][idx]
+            cv.itemconfig(st['canvas_items'][idx], image=photo)
+        except Exception:
+            pass
+        st['loaded'][idx] = True
+        st['done'] += 1
+
+    def _add_tile(self, side, fpath, name, size):
+        """新增占位缩略图单元：缩略图在上、文件名在下，缩略图稍后由线程填充"""
+        st = self._state[side]
+        from PIL import Image, ImageTk
+        placeholder = ImageTk.PhotoImage(Image.new('RGB', (size, size), (58, 62, 70)))
+        tile = ttk.Frame(st['inner'])
+        cv = tk.Canvas(tile, width=size, height=size, bd=0,
+                       highlightthickness=0, bg="#2b2f36")
+        img_item = cv.create_image(size // 2, size // 2, image=placeholder)
+        cv.pack(side=tk.TOP)
+        lbl = ttk.Label(tile, text=name, wraplength=size, justify='center',
+                        anchor='center')
+        lbl.pack(side=tk.TOP, fill=tk.X, pady=(3, 0))
+        st['photos'].append(placeholder)
+        st['tiles'].append(tile)
+        st['fpaths'].append(fpath)
+        st['labels'].append(lbl)
+        st['canvases'].append(cv)
+        st['canvas_items'].append(img_item)
+        st['loaded'].append(False)
+        for w in (tile, cv, lbl):
+            w.bind("<Double-1>", lambda e, p=fpath: self._on_tile_double(side, p))
+
+    def _on_tile_double(self, side, fpath):
+        norm = os.path.normcase(os.path.abspath(fpath))
+        if norm in self._state[side].get('deleted_map', {}):
+            self.parent.show_toast("该文件已被删除，无法加入对比", "warning")
+            return
+        target = 'A' if side == 'left' else 'B'
+        try:
+            self.parent._load_video_side(target, fpath)
+            self.parent.show_toast(f"已加入对比{target}：{os.path.basename(fpath)}", "success")
+        except Exception as e:
+            self.parent.show_toast(f"加入失败：{e}", "error")
+
+    def _reload_all(self):
+        for side in ('left', 'right'):
+            st = self._state[side]
+            if st['folder']:
+                self._open_folder(side)
+
+    def mark_renamed(self, old_path, new_path):
+        """主窗口更名后，同步更新左右两侧列表中该文件的文件名显示"""
+        old = os.path.normcase(os.path.abspath(old_path))
+        new_name = os.path.basename(new_path)
+        for side in ('left', 'right'):
+            st = self._state.get(side)
+            fpaths = st.get('fpaths') if st else None
+            if not fpaths:
+                continue
+            labels = st.get('labels', [])
+            for idx, fp in enumerate(fpaths):
+                if os.path.normcase(os.path.abspath(fp)) == old:
+                    fpaths[idx] = new_path
+                    try:
+                        labels[idx].configure(text=new_name)
+                    except Exception:
+                        pass
+            st['status'].set(f"已同步更名：{new_name}")
+
+    def mark_removed(self, path):
+        """主窗口删除后，左右两侧列表中匹配的文件打上“已删除”标记（保留位置便于对照）"""
+        norm = os.path.normcase(os.path.abspath(path))
+        updated = False
+        for side in ('left', 'right'):
+            st = self._state.get(side)
+            fpaths = st.get('fpaths') if st else None
+            if not fpaths:
+                continue
+            st.setdefault('deleted_map', {})[norm] = True
+            for idx, fp in enumerate(fpaths):
+                if os.path.normcase(os.path.abspath(fp)) == norm:
+                    cv = st['canvases'][idx]
+                    try:
+                        size = cv.winfo_width() or int(cv.cget('width'))
+                        cv.create_rectangle(0, 0, size, size,
+                                            fill='#1a1a1a', stipple='gray50',
+                                            outline='')
+                        cv.create_text(size // 2, size // 2, text='已删除',
+                                       fill='#ff5252',
+                                       font=('Arial', max(10, size // 8)))
+                    except Exception:
+                        pass
+                    updated = True
+        if updated:
+            for side in ('left', 'right'):
+                st = self._state.get(side)
+                if st:
+                    st['status'].set("列表已同步：有文件被删除")
+
+    def _center(self):
+        root = self.parent.frame.winfo_toplevel()
+        self.update_idletasks()
+        rw, rh = root.winfo_width(), root.winfo_height()
+        rx, ry = root.winfo_rootx(), root.winfo_rooty()
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        w = min(1320, sw - 80)
+        h = min(840, sh - 120)
+        x = rx + max(0, (rw - w) // 2)
+        y = ry + max(0, (rh - h) // 2)
+        x = max(0, min(x, sw - w))
+        y = max(0, min(y, sh - h))
+        self.geometry(f"{w}x{h}+{x}+{y}")
+
+    def _make_thumbnail(self, fpath, size, is_video):
+        """生成方形缩略图（Tk 可显示的 PhotoImage）"""
+        from PIL import ImageTk
+        return ImageTk.PhotoImage(self._compose_thumbnail(fpath, size, is_video))
+
+    def _compose_thumbnail(self, fpath, size, is_video):
+        """合成缩略图：视频加胶片边框+黄色播放角标，图片加蓝色边框+照片角标"""
+        from PIL import Image, ImageDraw
+        ext = os.path.splitext(fpath)[1].lower()
+        im = None
+        try:
+            if ext in self.parent.IMAGE_EXTENSIONS:
+                im = Image.open(fpath).convert('RGB')
+            else:
+                import cv2
+                cap = cv2.VideoCapture(fpath)
+                try:
+                    ret, frame = cap.read()
+                finally:
+                    cap.release()
+                if ret and frame is not None:
+                    im = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        except Exception:
+            im = None
+
+        W = H = size
+        bg = Image.new('RGB', (W, H), (38, 42, 50))
+        if im is not None:
+            pad = 10 if is_video else 4
+            inner_w, inner_h = W - 2 * pad, H - 2 * pad
+            im = im.copy()
+            im.thumbnail((inner_w, inner_h))
+            bg.paste(im, (pad + (inner_w - im.width) // 2,
+                          pad + (inner_h - im.height) // 2))
+
+        d = ImageDraw.Draw(bg)
+        if is_video:
+            # 胶片边框 + 左右齿孔
+            d.rectangle([0, 0, W - 1, H - 1], outline=(16, 16, 16), width=3)
+            hole_w = max(3, W // 24)
+            hole_h = max(4, H // 18)
+            step = hole_h + max(4, H // 24)
+            y = 7
+            while y + hole_h < H - 5:
+                for x in (3, W - 3 - hole_w):
+                    d.rounded_rectangle([x, y, x + hole_w, y + hole_h],
+                                        radius=2, fill=(235, 235, 235))
+                y += step
+            # 黄色播放角标
+            bw = max(26, int(W * 0.30))
+            bh = max(18, int(H * 0.20))
+            bx, by = W - bw - 4, H - bh - 4
+            d.rounded_rectangle([bx, by, bx + bw, by + bh],
+                                radius=5, fill=(255, 196, 0))
+            cx, cy, s = bx + bw * 0.40, by + bh / 2.0, bh * 0.28
+            d.polygon([(cx - s, cy - s), (cx - s, cy + s), (cx + s * 1.3, cy)],
+                      fill=(35, 35, 35))
+        else:
+            # 图片：蓝色边框 + 照片角标
+            d.rectangle([0, 0, W - 1, H - 1], outline=(86, 150, 214), width=2)
+            bw = max(26, int(W * 0.26))
+            bh = max(16, int(H * 0.17))
+            bx, by = W - bw - 4, H - bh - 4
+            d.rounded_rectangle([bx, by, bx + bw, by + bh],
+                                radius=4, fill=(70, 140, 210))
+            ix0, iy0 = bx + bw * 0.20, by + bh * 0.25
+            ix1, iy1 = bx + bw * 0.80, by + bh * 0.75
+            d.rectangle([ix0, iy0, ix1, iy1], outline=(255, 255, 255), width=2)
+            d.polygon([(ix0 + 2, iy1 - 2),
+                       (ix0 + (ix1 - ix0) * 0.40, iy0 + (iy1 - iy0) * 0.45),
+                       (ix0 + (ix1 - ix0) * 0.65, iy1 - 2)],
+                      fill=(255, 255, 255))
+        return bg
 
 
 # ==================== 独立运行入口 ====================

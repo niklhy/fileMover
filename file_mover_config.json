@@ -3,13 +3,23 @@
   "target_folder": "",
   "include_subfolders": false,
   "file_move_tab": {
-    "directory": "",
+    "directory": "X:\\无码\\国产\\【黑猫原创】\\386",
     "mode": "flatten",
     "all_subfolders": false,
-    "only_video": true,
+    "rename_folder": true,
+    "proc_video": true,
+    "proc_sub": false,
+    "proc_other": false,
     "dry_run": true,
-    "folder_b": "Z:\\下载\\202608\\0已下载",
+    "folder_b": "X:\\无码\\国产\\【D先生】合集",
     "folder_whole": true,
+    "folder_b_history": [
+      "X:\\无码\\国产\\【D先生】合集",
+      "X:\\无码\\国产\\【Nana】",
+      "X:\\系列",
+      "X:\\无码\\国产",
+      "Y:\\Other\\无系列、不收集系列"
+    ],
     "finish_action": "none"
   }
 }

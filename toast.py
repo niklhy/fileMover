@@ -54,7 +54,8 @@ class ToastNotifier:
             win.withdraw()                       # 先隐藏，避免在屏幕左上角闪现
             win.wm_overrideredirect(True)
             try:
-                win.wm_attributes('-topmost', True)
+                # 注意：不用全局 '-topmost'，否则会盖住其它软件窗口；
+                # 只需保持在主窗口之上（见 _keep_above）
                 win.wm_attributes('-alpha', 0.96)
             except Exception:
                 pass
@@ -72,7 +73,12 @@ class ToastNotifier:
             self._toasts.append((win, root))
             self._relayout()
             win.deiconify()
-            win.lift()
+            try:
+                win.transient(root)      # 归属主窗口，不单独出现在任务栏
+                win.lift(root)           # 只压在主窗口之上，不置顶全局
+            except Exception:
+                pass
+            self._keep_above(win, root)
             win.after(duration, lambda w=win: self._close(w))
         except Exception:
             # 任何异常都不能留下无法关闭的“僵尸”浮窗
@@ -81,6 +87,26 @@ class ToastNotifier:
             except Exception:
                 pass
             raise
+
+    def _keep_above(self, win, root):
+        """周期性把 toast 维持在主窗口之上（但不会盖住其它应用窗口）。
+
+        主窗口被其它窗口覆盖时 toast 同样被覆盖；主窗口被点击/刷新后
+        toast 重新浮到主窗口上方。不使用全局 -topmost，也不抢焦点。
+        """
+
+        def _tick():
+            if not win.winfo_exists():
+                return
+            try:
+                if root is not None and root.winfo_exists() \
+                        and root.state() == 'normal':
+                    win.lift(root)
+            except Exception:
+                pass
+            win.after(500, _tick)
+
+        win.after(500, _tick)
 
     def _relayout(self):
         """在主窗口右下角自下而上堆叠所有 toast，并保证不超出窗口边界"""

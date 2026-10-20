@@ -44,9 +44,16 @@ file_mover/
 ├── video_grid_tab.py       # Tab: 视频缩略图
 ├── video_check_tab.py      # Tab: 视频文件检查
 ├── subtitle_tab.py         # Tab: 视频语音识别并翻译为字幕（也可独立运行）
+├── workflow_tab.py         # Tab: 多任务串联工作流（移动/剪辑转码/字幕 编排，也可独立运行）
 ├── log_tab.py              # Tab: 操作日志
 ├── new_feature_tab.py      # 示例：如何添加新选项卡的模板
 │
+├── workflow/               # 多任务串联模块（由三个现有 Tab 打通而成）
+│   ├── models.py           #   UID 唯一标识 / WorkflowItem / WorkflowStep / WorkflowJob
+│   ├── steps.py            #   步骤执行器（复用 file_move_tab / video_grid_tab / subtitle）
+│   └── executor.py         #   无人值守执行引擎（WorkflowExecutor 线程）
+│
+├── test_workflow.py        # 工作流模块端到端自测（python test_workflow.py）
 ├── toast.py                # 公共组件：右下角浮出式提醒（Toast，全程序复用）
 ├── subtitle/               # 字幕生成模块（由「视频语音识别并翻译为字幕」项目移植）
 │   ├── config.py           #   常量、模型清单、配置读写（subtitle/subtitle_config.json）
@@ -165,6 +172,38 @@ def _append_log(self, message):
 - 任务列表支持拖放（文件夹可递归多级子目录，由“包含子文件夹”控制）、Ctrl/Shift 多选、
   移除选中 / 只处理选中 / 一键清空。拖放依赖 `tkinterdnd2`，未安装时自动降级（仅按钮添加）。
 
+### 6. 多任务串联工作流（workflow_tab.py + workflow/）
+
+把已有的「文件夹下移动」「视频剪辑转码」「视频转字幕」三个 Tab **打通为可编排的流水线**，
+支持无人值守跑完一整条链路（例如 A→B→剪辑转码→C→生成字幕）。
+
+```
+┌────────────────┐   扫描    ┌──────────────┐   按序执行   ┌─────────────────┐
+│  源文件夹 A     │ ───────> │ WorkflowItem │ ──────────> │ 步骤1 → 步骤2 …  │
+│（分配 UID）     │          │ uid/origin/  │             │ 移动 / 转码 /字幕│
+└────────────────┘          │ current(Vn)  │             └─────────────────┘
+                            └──────────────┘
+```
+
+**唯一标识（UID）**：视频进入流程时用 `PatternMatcher` 提取番号作为 UID（无番号则用文件名
+主干/UUID），同一条 `WorkflowItem` 的 `current` 随阶段推进（V1→V2→V3），`history` 记录每次
+变化。目标文件夹与输出文件名支持 `{uid} {stem} {name} {ext} {src_dir} {cur_dir} {date}` 变量。
+
+**步骤类型**：`move`（移动到文件夹）/ `transcode`（剪辑与重编码）/ `subtitle`（生成字幕）。
+可在界面上增删、上下移动调整顺序、单独启用/禁用，从而组合出不同的任务路径。
+
+**无重复实现**：三个步骤全部复用现有模块 ——
+- 移动：复用 `file_move_tab.unique_dst` 的去重落盘规则；
+- 剪辑转码：`workflow/steps.HeadlessTranscoder` 用 `__new__` 造出无界面的
+  `VideoTranscodePanel` 实例并直接调用其 `_worker`，完整沿用编码器选择、CUDA 降级重试、
+  字幕时间轴平移等逻辑；剪辑时间对话框直接复用 `EmbeddedPlayer` / `TrimRangeBar` /
+  `TimeEntry` 三个控件（滑块 + −/+ 微调 + 设为当前 + 移到最前/最后）；
+- 生成字幕：复用 `subtitle.core.SubtitleGenerator` 与 `subtitle.system_utils` 的模型解析。
+
+**执行引擎**：`workflow/executor.WorkflowExecutor` 为后台线程，两级循环
+（条目 → 步骤顺序），支持停止信号、出错继续、完成后关机/睡眠，全过程不弹窗。
+配置保存在 `app_config.json` 的 `workflow_tab` 分区。
+
 ## 开发规范
 
 ### 代码风格
@@ -222,7 +261,18 @@ python file_organize_tab.py
 
 # 独立运行字幕生成工具（完整窗口，与主程序共用 subtitle/ 模块）
 python subtitle_tab.py
+
+# 独立运行工作流串联工具（移动/剪辑转码/字幕 编排）
+python workflow_tab.py
 ```
+
+### 工作流串联自测
+
+```bash
+python test_workflow.py      # 端到端跑通两条完整链路 + 失败/停止场景（36 项断言）
+```
+
+测试会调用系统 ffmpeg 真实生成与转码视频；字幕步骤用桩函数替代（不依赖大模型文件）。
 
 ### 依赖安装
 

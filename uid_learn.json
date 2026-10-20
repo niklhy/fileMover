@@ -1,0 +1,17 @@
+{
+ "mappings": {
+  "489155.com@abc-123.mp4": "abc123",
+  "hnd00916": "hnd916",
+  "[zzpp01.com]-mifd042c(1)": "mifd042",
+  "ipx00590.": "IPX-590",
+  "hjd2048.com-0703abp748-h264": "ABP-748"
+ },
+ "junk_prefixes": {
+  "489155.com@": 1,
+  "[zzpp01.com]-": 1
+ },
+ "junk_suffixes": {
+  ".mp4": 1,
+  "c(1)": 1
+ }
+}

@@ -3634,6 +3634,49 @@ class WebGrabTab:
                   text="修改后立即生效，按修改时间从旧到新清理超容缓存",
                   foreground="#888888").pack(side=tk.LEFT, padx=6)
 
+        # 操作按钮：打开缓存文件夹 / 一键清空缓存
+        cache_btn_row = ttk.Frame(cache_frame)
+        cache_btn_row.pack(fill=tk.X, padx=5, pady=(0, 6))
+
+        def open_cache_folder():
+            """用资源管理器打开缓存文件夹（便于手动清理）"""
+            try:
+                os.makedirs(LIST_CACHE_DIR, exist_ok=True)
+                os.startfile(LIST_CACHE_DIR)   # Windows：以文件夹形式在资源管理器打开
+            except Exception as e:
+                messagebox.showerror("错误", f"无法打开缓存文件夹：{e}", parent=win)
+
+        def clear_cache_all():
+            """一键清空缓存文件夹内的全部文件"""
+            try:
+                os.makedirs(LIST_CACHE_DIR, exist_ok=True)
+            except Exception:
+                pass
+            files = [fp for fp in glob.glob(os.path.join(LIST_CACHE_DIR, '*'))
+                     if os.path.isfile(fp)]
+            if not files:
+                messagebox.showinfo("提示", "缓存文件夹当前为空，无需清理", parent=win)
+                return
+            if not messagebox.askyesno(
+                    "确认", f"确定要清空缓存文件夹吗？\n将删除 {len(files)} 个文件"
+                            f"（含列表页缩略图与详情页图片），此操作不可恢复。",
+                    parent=win):
+                return
+            removed = 0
+            for fp in files:
+                try:
+                    os.remove(fp)
+                    removed += 1
+                except OSError:
+                    pass
+            self._log(f"已手动清空列表缓存：删除 {removed} 个文件")
+            messagebox.showinfo("完成", f"已清空缓存文件夹（删除 {removed} 个文件）", parent=win)
+
+        ttk.Button(cache_btn_row, text="打开缓存文件夹", width=16,
+                   command=open_cache_folder).pack(side=tk.LEFT, padx=2)
+        ttk.Button(cache_btn_row, text="一键清空缓存", width=16,
+                   command=clear_cache_all).pack(side=tk.LEFT, padx=2)
+
         # ----- 本地翻译大模型：为每个模型指定所在文件夹 -----
         model_frame = ttk.LabelFrame(body, text="本地翻译大模型（为各模型指定所在文件夹）")
         model_frame.pack(fill=tk.X, pady=(8, 2))
@@ -5526,6 +5569,34 @@ class WebGrabTab:
         self._log(f"[列表页] 搜索「{keyword}」→ {url}")
         self._list_tab_open_url(url, name=f"搜索-{keyword}")
         self._list_status_var.set(f"搜索「{keyword}」：{url}")
+
+    def search_list_by_keyword(self, keyword: str) -> bool:
+        """供其它模块调用：在“视频列表层”以 keyword 为搜索关键字新建一个搜索页签。
+
+        不会切换主页面签；若列表层尚未打开会自动从右侧滑出。返回是否成功创建
+        （无可用基础网址时返回 False，由调用方自行提示用户）。
+        """
+        keyword = (keyword or '').strip()
+        if not keyword:
+            return False
+        base_url = (self.list_url_entry_var.get().strip()
+                    or self._host_of(
+                        str(self._list_active_tab_dict().get('url') or '')
+                        if self._list_active_tab_dict() else '')
+                    or str(getattr(self, '_list_active_host', '') or ''))
+        if not base_url:
+            return False
+        path = str(self._list_search_info.get('path') or '').strip()
+        url = build_search_url(base_url, keyword, path,
+                               (self.list_search_path_var.get()
+                                if hasattr(self, 'list_search_path_var') else '')
+                               or DEFAULT_LIST_SEARCH_PATH)
+        if not url:
+            return False
+        self._log(f"[列表页] 搜索「{keyword}」→ {url}")
+        self._list_tab_open_url(url, name=f"搜索-{keyword}")
+        self._list_status_var.set(f"搜索「{keyword}」：{url}")
+        return True
 
     # ---------- 列表页页签（每个页签配套保存“网址 + 页码”） ----------
     @staticmethod
@@ -9586,6 +9657,62 @@ class WebGrabTab:
         except Exception:
             pass
 
+    # ----- 详情页图片（主图/样例图）磁盘缓存：与列表页缩略图共用 LIST_CACHE_DIR -----
+    def _detail_image_cache_path(self, url: str) -> str:
+        """详情页图片的磁盘缓存路径（保留原扩展名；识别不出用 .jpg）"""
+        ext = os.path.splitext(urllib.parse.urlparse(url).path)[1].lower()
+        if ext not in ('.jpg', '.jpeg', '.png', '.gif', '.webp'):
+            ext = '.jpg'
+        return os.path.join(LIST_CACHE_DIR, 'd_' + self._list_cache_key(url) + ext)
+
+    def _load_image_from_disk_cache(self, url: str) -> Optional[bytes]:
+        """从磁盘缓存读取图片字节（无缓存或异常时返回 None）"""
+        if not url:
+            return None
+        path = self._detail_image_cache_path(url)
+        if os.path.isfile(path):
+            try:
+                with open(path, 'rb') as f:
+                    return f.read()
+            except Exception:
+                pass
+        return None
+
+    def _save_image_to_disk_cache(self, url: str, data: bytes):
+        """把图片字节写入磁盘缓存（仅首次写入；写后按上限清理超容文件）"""
+        if not url or not data:
+            return
+        try:
+            os.makedirs(LIST_CACHE_DIR, exist_ok=True)
+            path = self._detail_image_cache_path(url)
+            if not os.path.isfile(path):
+                with open(path, 'wb') as f:
+                    f.write(data)
+                self._list_trim_cache()
+        except Exception:
+            pass
+
+    def _fetch_image_cached(self, url: str) -> Optional[bytes]:
+        """取图片字节：内存缓存 → 磁盘缓存 → 联网下载并落盘（三者按顺序尝试）
+
+        返回的数据由调用方在“主线程”写入内存缓存（self._cache_put），
+        本方法只在后台线程做“读内存/读磁盘/下载+落盘”，避免多线程写同一个字典。
+        联网下载成功后立即写入磁盘缓存，使软件关闭再打开、或重复切换页签时
+        无需重新联网，可直接从磁盘缓存读取详情页图片。
+        """
+        if not url:
+            return None
+        data = self._image_cache.get(url)           # 1) 内存缓存（最快）
+        if data:
+            return data
+        data = self._load_image_from_disk_cache(url)  # 2) 磁盘缓存（跨会话/跨页签复用）
+        if data:
+            return data
+        data = self.worker.download_image(url) if self.worker else None  # 3) 联网
+        if data:
+            self._save_image_to_disk_cache(url, data)
+        return data
+
     def _list_open_url(self, url: Optional[str] = None, page: Optional[int] = None,
                        use_cache: bool = True):
         """打开（抓取）指定列表页地址
@@ -11092,7 +11219,7 @@ class WebGrabTab:
 
         def load():
             try:
-                data = self.worker.download_image(url)
+                data = self._fetch_image_cached(url)
                 if data:
                     self._run_in_main_thread(lambda: self._cache_put(url, data))
             except Exception:
@@ -11113,7 +11240,7 @@ class WebGrabTab:
 
                 def load(url=u):
                     try:
-                        data = self.worker.download_image(url) if self.worker else None
+                        data = self._fetch_image_cached(url)
                         if data:
                             self._run_in_main_thread(lambda: self._cache_put(url, data))
                     except Exception:
@@ -12009,13 +12136,8 @@ class WebGrabTab:
         if not url:
             self._log("未找到主图地址，跳过主图保存")
             return
-        # 优先用缓存（与图片缓存加速切换一致），否则回退下载
-        data = self._image_cache.get(url) if hasattr(self, '_image_cache') else None
-        if not data and self.worker:
-            try:
-                data = self.worker.download_image(url)
-            except Exception:
-                data = None
+        # 优先用内存/磁盘缓存（与图片缓存加速切换一致），否则回退联网下载
+        data = self._fetch_image_cached(url) if hasattr(self, '_fetch_image_cached') else None
         if not data:
             self._log("主图获取失败，无法保存 cover.jpg")
             return
@@ -13336,7 +13458,7 @@ class WebGrabTab:
         def load():
             data = None
             try:
-                data = self.worker.download_image(thumb_url) if self.worker else None
+                data = self._fetch_image_cached(thumb_url)
             except Exception:
                 data = None
             finally:
