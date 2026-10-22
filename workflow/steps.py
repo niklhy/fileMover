@@ -42,6 +42,12 @@ except Exception:  # pragma: no cover
             i += 1
 
 
+# 转码输出到原文件夹且不删除源文件时，新文件在原文件名后加此后缀以与旧文件共存
+# （如 name.mp4 → name_转码.mp4）；若后续还有“修改名称”/“移动”步骤，则对这份
+# 新文件继续按后续任务执行。
+TRANSCODE_COEXIST_SUFFIX = "_转码"
+
+
 class StepStopped(Exception):
     """用户请求停止"""
 
@@ -161,6 +167,19 @@ class StepContext:
         """条目状态在步骤内被修改后，请求界面刷新列表（执行器会节流）"""
         try:
             self._notify()
+        except Exception:
+            pass
+
+    def status(self, text: str):
+        """更新当前条目“状态”列的实时阶段短文本（如“剪辑 45%”“移动中”），并刷新列表。
+
+        执行器在创建 ctx 时注入 status_setter；独立调用（如测试）未注入时为空操作。
+        """
+        fn = getattr(self, 'status_setter', None)
+        if fn is None:
+            return
+        try:
+            fn(str(text))
         except Exception:
             pass
 
@@ -381,6 +400,7 @@ def run_move(item: WorkflowItem, params: Dict[str, Any], ctx: StepContext) -> st
 
     dest = unique_dst(dest_dir / src.name)
     ctx.log(f"[移动] {src.name} → {dest}")
+    ctx.status("移动中")   # 同步显示到视频清单“状态”列
     try:
         shutil.move(str(src), str(dest))
     except Exception as e:
@@ -409,6 +429,29 @@ def run_move(item: WorkflowItem, params: Dict[str, Any], ctx: StepContext) -> st
 # ==================================================================
 # 步骤二：剪辑与重编码
 # ==================================================================
+def _effective_bitrate(tc: "HeadlessTranscoder", src_path: str,
+                       setting: int, ctx: StepContext) -> int:
+    """“低于设置值不修改”的目标码率计算。
+
+    探测原片视频流码率（kbps）：原片低于设置值 → 保持原片码率（避免低码率视频被
+    强行拉高、体积虚增）；原片高于设置值 → 降到设置值（控制体积/统一规格）。
+    探测失败或原片码率不可读时回退为设置值。
+    """
+    try:
+        src_br = tc._p._probe_stream_bitrate_kbps(str(src_path))
+    except Exception:
+        src_br = 0
+    if not src_br or src_br < 100:
+        return setting
+    if src_br < setting:
+        ctx.log(f"[码率] {Path(src_path).name}: 原片码率 {int(src_br)} kbps 低于设置值 "
+                f"{setting} kbps，保持原片码率")
+        return int(round(src_br))
+    ctx.log(f"[码率] {Path(src_path).name}: 原片码率 {int(src_br)} kbps 高于设置值 "
+            f"{setting} kbps，降到设置值")
+    return setting
+
+
 def _resolve_trim(item: WorkflowItem, params: Dict[str, Any],
                   duration: float) -> (float, float):
     """计算剪辑起止时间（秒）"""
@@ -490,14 +533,18 @@ def run_transcode(item: WorkflowItem, params: Dict[str, Any], ctx: StepContext) 
     except Exception as e:
         raise StepError(f"无法创建输出文件夹 {out_dir}: {e}")
     intended = out_dir / out_name
-    # 输出文件名与原文件相同（如用 {name} 且同一文件夹）：ffmpeg 不能对同名文件同时
-    # 读写，因此先输出到临时名，转码成功后再删除原文件、把临时成片改回原名（原地替换）
-    inplace = os.path.normcase(str(intended)) == os.path.normcase(str(src))
-    # 转码输出到原文件夹且后续有“修改名称”步骤：绝不原地替换/删除原始视频——
-    # 始终写到不冲突的名字，最终命名交给改名步骤（组合意图是生成新文件而非覆盖原片）。
-    if getattr(ctx, 'rename_after_transcode', False):
-        inplace = False
-    if inplace:
+    src_in_same_dir = os.path.normcase(str(intended)) == os.path.normcase(str(src))
+    del_src = bool(params.get('del_src'))
+    # 是否“原地替换原文件”（输出路径与源完全相同）：仅当输出到原文件夹且
+    # 勾选“转码后删除源文件”时——成片沿用原文件名，直接替换旧文件。
+    inplace = src_in_same_dir and del_src
+    if src_in_same_dir and not del_src:
+        # 输出到原文件夹且不删除源文件：新文件与旧文件共存，在原文件名后加后缀
+        # （如 name.mp4 → name_转码.mp4），不覆盖、不删除原始视频；若后续还有
+        # “修改名称”/“移动”步骤，则对这份新文件继续按后续任务执行。
+        out = unique_dst(out_dir / f"{src.stem}{TRANSCODE_COEXIST_SUFFIX}.{ext}")
+    elif inplace:
+        # 原地替换：先输出到临时名，转码成功后再删除原文件、把临时成片改回原名
         out = out_dir / (".wf_tmp_" + out_name)
         if out.exists():
             out = unique_dst(out)
@@ -531,12 +578,19 @@ def run_transcode(item: WorkflowItem, params: Dict[str, Any], ctx: StepContext) 
             ctx.log(f"[提示] 未找到可封装的字幕，本次按“不添加字幕”处理")
             sub_mode = 'none'
 
+    # “低于设置值不修改”：重编码且未勾选“不修改码率”时，按原片码率与设置值取较小者
+    # （原片高于设置值 → 降到设置值；原片低于设置值 → 保持原片码率，避免体积虚增）
+    keep_br = bool(params.get('keep_bitrate', False))
+    bitrate = int(params.get('bitrate') or 2500)
+    if bool(params.get('bitrate_below_keep', False)) and not keep_br and not keep_quality:
+        bitrate = _effective_bitrate(tc, src, bitrate, ctx)
+
     task = tc.TranscodeTask(
         src=str(src), start=start, end=end,
         src_w=item.width, src_h=item.height, fps=item.fps,
         resolution=params.get('resolution') or '1280x720',
         aspect=params.get('aspect') or '保持原比例',
-        bitrate=int(params.get('bitrate') or 2500),
+        bitrate=bitrate,
         save_mode='custom', save_dir=str(out_dir),
         out_ext=ext, subtitle_mode=sub_mode, subtitle=srt,
         keep_quality=keep_quality,
@@ -550,6 +604,8 @@ def run_transcode(item: WorkflowItem, params: Dict[str, Any], ctx: StepContext) 
     task._encoder_label = params.get('encoder') or ENCODER_LABELS['auto']  # noqa: SLF001
 
     ctx.log(f"[转码] {src.name} → {out.name}")
+    # 起始阶段写入“状态”列（流拷贝无进度回调，保持该状态直至完成）
+    ctx.status("流拷贝剪辑中" if keep_quality else "剪辑中")
     # 重资源操作（NVENC/CUDA 全显存流水线）与语音识别、翻译共享同一把“重资源锁”，
     # 保证多线程下任意时刻只有一个重资源操作在跑，避免多个视频同时转码/识别/翻译抢占
     # 显存与硬件编码器导致崩溃或爆显存。文件类步骤（移动/改名）不抢此锁，仍可并行。
@@ -557,8 +613,11 @@ def run_transcode(item: WorkflowItem, params: Dict[str, Any], ctx: StepContext) 
     if res_lock is not None:
         res_lock.acquire()
     try:
-        result = tc.run(task, is_stopped=ctx.stopped,
-                        on_progress=lambda pct: ctx.progress(pct, f"转码 {src.name}"))
+        def _tc_progress(pct):
+            ctx.progress(pct, f"转码 {src.name}")
+            ctx.status(f"剪辑 {int(pct)}%")   # 同步显示到视频清单“状态”列
+
+        result = tc.run(task, is_stopped=ctx.stopped, on_progress=_tc_progress)
     finally:
         if res_lock is not None:
             res_lock.release()
@@ -571,7 +630,8 @@ def run_transcode(item: WorkflowItem, params: Dict[str, Any], ctx: StepContext) 
     if not produced.exists():
         raise StepError(f"转码输出文件不存在: {produced}")
 
-    # 原地替换：转码成功后删除原文件，把临时成片改回原始文件名
+    # 原地替换：转码成功后删除原文件，把临时成片改回原始文件名（文件名不变）
+    replaced = False
     if inplace:
         try:
             if src.exists() and os.path.normcase(os.path.abspath(str(src))) != \
@@ -579,12 +639,15 @@ def run_transcode(item: WorkflowItem, params: Dict[str, Any], ctx: StepContext) 
                 os.remove(str(src))
             os.replace(str(produced), str(intended))
             produced = intended
+            replaced = True
             ctx.log(f"[替换原文件] {src.name}（成片已原地替换）")
         except Exception as e:
             raise StepError(f"替换原文件失败（临时成片位于 {produced}）: {e}")
 
-    # 转码成功且勾选时删除转码源文件（绝不删除刚生成的成片；原地替换时已删除）
-    if params.get('del_src') and os.path.normcase(os.path.abspath(str(src))) != \
+    # 转码成功且勾选“删除源文件”（非原地替换场景）：删除转码源文件，
+    # 绝不影响刚生成的成片（成片与源是不同文件）。
+    if params.get('del_src') and not replaced and \
+            os.path.normcase(os.path.abspath(str(src))) != \
             os.path.normcase(os.path.abspath(str(produced))):
         try:
             os.remove(str(src))
@@ -636,6 +699,7 @@ def _run_merge_transcode(items: List[WorkflowItem], params: Dict[str, Any],
         if not seg_src.exists():
             raise StepError(f"拼接源文件不存在: {seg_src}")
         ctx.log(f"[拼接] 探测第 {idx}/{len(items)} 段: {seg_src.name}")
+        ctx.status(f"拼接探测 {idx}/{len(items)}")   # 同步显示到视频清单“状态”列
         info = tc.probe(str(seg_src))
         dur = float(getattr(info, 'duration', 0) or 0)
         start, end = _resolve_trim(it, params, dur)
@@ -672,6 +736,18 @@ def _run_merge_transcode(items: List[WorkflowItem], params: Dict[str, Any],
                 ctx.log(f"[拼接] 不修改码率：按首段原片码率 {bitrate} kbps 统一编码")
         except Exception:
             pass
+    elif bool(params.get('bitrate_below_keep', False)) and not params.get('keep_quality'):
+        # “低于设置值不修改”：各段按“原片低于设置值则保持、否则降到设置值”取最大值
+        # 作为统一码率（拼接需规格一致；该取值既不突破设置值，也不强行拉高低码率段）
+        rates = []
+        for s in segments:
+            try:
+                b = tc._p._probe_stream_bitrate_kbps(s["src"])
+            except Exception:
+                b = 0
+            rates.append(int(b) if (b and b >= 100 and b < bitrate) else bitrate)
+        bitrate = max(rates) if rates else bitrate
+        ctx.log(f"[拼接] 低于设置值不修改：统一码率 {bitrate} kbps")
 
     merge_name = f"{Path(segments[0]['src']).stem}_合并"
     out = unique_dst(out_dir / f"{merge_name}.{ext}")
@@ -697,8 +773,11 @@ def _run_merge_transcode(items: List[WorkflowItem], params: Dict[str, Any],
     if res_lock is not None:
         res_lock.acquire()
     try:
-        result = tc.run(task, is_stopped=ctx.stopped,
-                        on_progress=lambda pct: ctx.progress(pct, "拼接转码"))
+        def _merge_progress(pct):
+            ctx.progress(pct, "拼接转码")
+            ctx.status(f"拼接 {int(pct)}%")
+
+        result = tc.run(task, is_stopped=ctx.stopped, on_progress=_merge_progress)
     finally:
         if res_lock is not None:
             res_lock.release()
@@ -909,8 +988,32 @@ def run_subtitle(item: WorkflowItem, params: Dict[str, Any], ctx: StepContext) -
     use_ctx = coord.use(item.uid, needs_asr, needs_translate, build_kwargs) if coord is not None else None
     if use_ctx is None:
         gen = SubtitleGenerator(**build_kwargs)
+
+    # “停止”响应：把取消钩子挂到 ctx（执行器 stop() → ctx.mark_stopped() → 此处）。
+    # 字幕各阶段在检查点协作式退出（音频提取 / 语音识别 / 逐条翻译）；
+    # 模型加载等不可中断的 Python 阻塞调用完成后，在下一个检查点立即退出。
+    _gen_ref: List[Any] = []
+
+    def _cancel_gen():
+        g = _gen_ref[0] if _gen_ref else None
+        if g is None:
+            return
+        try:
+            g.cancel()            # process_video 在检查点返回 CANCELLED
+        except Exception:
+            pass
+        try:
+            g.kill_audio_proc()   # 立即终止进行中的音频提取子进程（若有）
+        except Exception:
+            pass
+
+    ctx.set_stop_setter(_cancel_gen)
     try:
         def _progress(p, stage=""):
+            if stage:
+                # 语音提取/加载模型/识别/生成字幕等阶段同步显示到视频清单“状态”列
+                item.status = str(stage)
+                ctx.notify_item()
             ctx.progress(float(p), f"{src.name} {stage}")
 
         _TRANS_RE = re.compile(r'正在翻译第\s*(\d+)\s*/\s*(\d+)\s*条字幕')
@@ -925,23 +1028,31 @@ def run_subtitle(item: WorkflowItem, params: Dict[str, Any], ctx: StepContext) -
                 return
             ctx.log(f"  · {m}")
 
-        if use_ctx is not None:
-            with use_ctx as gen:
+        try:
+            if use_ctx is not None:
+                with use_ctx as gen:
+                    _gen_ref.append(gen)
+                    result = gen.process_video(
+                        str(src), output_srt=str(out_srt),
+                        bilingual=needs_translate,
+                        progress_callback=_progress,
+                        status_callback=_status,
+                        pause_callback=ctx.check_pause,   # 暂停时，逐条翻译循环在此协作式阻塞
+                    )
+            else:
+                _gen_ref.append(gen)
                 result = gen.process_video(
                     str(src), output_srt=str(out_srt),
                     bilingual=needs_translate,
                     progress_callback=_progress,
                     status_callback=_status,
-                    pause_callback=ctx.check_pause,   # 暂停时，逐条翻译循环在此协作式阻塞
+                    pause_callback=ctx.check_pause,
                 )
-        else:
-            result = gen.process_video(
-                str(src), output_srt=str(out_srt),
-                bilingual=needs_translate,
-                progress_callback=_progress,
-                status_callback=_status,
-                pause_callback=ctx.check_pause,
-            )
+        except Exception as e:
+            # 用户停止引发的中断异常（如“音频提取已取消”）→ 按正常停止处理，不算失败
+            if ctx.stopped():
+                raise StepStopped("已停止") from e
+            raise
     finally:
         # 仅非协调器路径（如独立测试）才在此释放；协调器统一在运行结束时释放
         if use_ctx is None:
@@ -950,8 +1061,8 @@ def run_subtitle(item: WorkflowItem, params: Dict[str, Any], ctx: StepContext) -
             except Exception:
                 pass
 
-    if ctx.stopped():
-        raise StepStopped("已停止")
+    if ctx.stopped() or result == "CANCELLED":
+        raise StepStopped("已停止")   # 用户停止：不算失败，也不保留半成品 srt
     if not result or not out_srt.exists():
         raise StepError("字幕生成失败（未产生 srt 文件）")
 
@@ -998,6 +1109,7 @@ def run_rename(item: WorkflowItem, params: Dict[str, Any], ctx: StepContext) -> 
     new_name = _sanitize_filename(new_name)
 
     dest = src.parent / new_name
+    ctx.status("改名中")   # 同步显示到视频清单“状态”列
     # 改名不得覆盖原始视频文件（多任务“转码到原文件夹 + 改名”的组合意图是生成新
     # 文件而非覆盖原片）：若目标名与原始视频文件同名，自动加数字后缀，而不是替换原片。
     origin = Path(item.origin) if item.origin else None

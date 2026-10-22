@@ -17,10 +17,12 @@
 from __future__ import annotations
 
 import gc
+import json
 import os
 import re
 import subprocess
 import threading
+import time
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog
@@ -128,8 +130,9 @@ class TrimTimeDialog:
     """
 
     def __init__(self, parent, video_path: str, start: float = 0.0, end: float = 0.0,
-                 use_custom: bool = False):
+                 use_custom: bool = False, item=None):
         self.video_path = video_path
+        self.item = item                        # 关联的 WorkflowItem（用于标记需剪辑/有字幕）
         self.result: Optional[tuple] = None      # (start, end, use_custom)
         self._active = 'start'
         self._loading = False
@@ -198,6 +201,21 @@ class TrimTimeDialog:
         self.end_var = tk.StringVar()
         self.precision_var = tk.StringVar(value="0.1S")
         self._build_time_rows()
+
+        # ---- 操作标记（仅当关联了视频条目时显示：标记该视频需剪辑 / 已有字幕）----
+        if self.item is not None:
+            markf = ttk.Frame(self.top)
+            markf.pack(fill=tk.X, padx=8, pady=(6, 0))
+            ttk.Label(markf, text="操作标记：", foreground="#555").pack(side=tk.LEFT)
+            self._mark_trim_btn = ttk.Button(
+                markf, text="✂ 需剪辑", width=12,
+                command=lambda: self._dlg_toggle_mark("need_trim"))
+            self._mark_trim_btn.pack(side=tk.LEFT, padx=3)
+            self._mark_sub_btn = ttk.Button(
+                markf, text="📝 有字幕", width=12,
+                command=lambda: self._dlg_toggle_mark("has_subtitle"))
+            self._mark_sub_btn.pack(side=tk.LEFT, padx=3)
+            self._refresh_dlg_marks()
 
         # ---- 提示与按钮 ----
         ttk.Label(self.top, text="点击滑块选中（蓝/红高亮），再用 −/+ 微调；"
@@ -278,6 +296,22 @@ class TrimTimeDialog:
                              state="readonly").pack(side=tk.RIGHT)
 
     # ---------------- 交互 ----------------
+    def _dlg_toggle_mark(self, attr: str):
+        """切换当前视频的“需剪辑 / 有字幕”标记（直接改在关联 item 上）"""
+        if self.item is None:
+            return
+        setattr(self.item, attr, not bool(getattr(self.item, attr)))
+        self._refresh_dlg_marks()
+
+    def _refresh_dlg_marks(self):
+        """按钮文字带 ✓ 表示该标记已打上，便于一眼看清当前状态"""
+        if self.item is None:
+            return
+        self._mark_trim_btn.configure(
+            text="✓ 需剪辑" if self.item.need_trim else "✂ 需剪辑")
+        self._mark_sub_btn.configure(
+            text="✓ 有字幕" if self.item.has_subtitle else "📝 有字幕")
+
     def _set_active(self, which: str):
         self._active = which
         self.trim_bar.set_active(which)
@@ -499,25 +533,28 @@ class WorkflowTab:
         # 操作按钮放在列表下方（先 pack 到底部占位，避免被列表挤到右侧）
         bar = ttk.Frame(lf)
         bar.pack(side=tk.BOTTOM, fill=tk.X, pady=(4, 0))
-        ttk.Button(bar, text="📂 添加文件", width=13, command=self._add_files).pack(side=tk.LEFT, padx=2)
         ttk.Button(bar, text="☑ 选中所有视频", width=13, command=self._select_all_items).pack(side=tk.LEFT, padx=2)
+        ttk.Button(bar, text="✂ 需剪辑", width=10, command=lambda: self._toggle_mark("need_trim")).pack(side=tk.LEFT, padx=2)
+        ttk.Button(bar, text="📝 有字幕", width=10, command=lambda: self._toggle_mark("has_subtitle")).pack(side=tk.LEFT, padx=2)
         ttk.Button(bar, text="✂ 设置剪辑时间", width=15, command=self._edit_trim).pack(side=tk.LEFT, padx=2)
         ttk.Button(bar, text="✏ 修改 UID", width=12, command=self._edit_uid).pack(side=tk.LEFT, padx=2)
         ttk.Button(bar, text="清除自定义时间", width=15, command=self._clear_trim).pack(side=tk.LEFT, padx=2)
-        ttk.Button(bar, text="📂 打开所在文件夹", width=16, command=self._open_folder).pack(side=tk.LEFT, padx=2)
         ttk.Button(bar, text="移除选中", width=11, command=self._remove_selected).pack(side=tk.LEFT, padx=2)
+        ttk.Button(bar, text="⬇ 导出", width=9, command=self._export_marks).pack(side=tk.LEFT, padx=2)
+        ttk.Button(bar, text="⬆ 导入", width=9, command=self._import_marks).pack(side=tk.LEFT, padx=2)
         ttk.Button(bar, text="清空", width=9, command=self._clear_items).pack(side=tk.LEFT, padx=2)
 
         # 列表 + 纵向滚动条
         listf = ttk.Frame(lf)
         listf.pack(fill=tk.BOTH, expand=True)
-        cols = ("uid", "file", "dir", "trim", "rate", "res", "status")
-        heads = ("UID", "当前文件", "所在文件夹", "剪辑时间", "数据速率", "分辨率", "状态")
-        widths = (100, 160, 150, 130, 95, 95, 85)
+        # 列顺序：UID → 标记（图标列，置于“当前文件”前）→ 当前文件 → … → 状态
+        cols = ("uid", "mark", "file", "dir", "trim", "rate", "res", "status")
+        heads = ("UID", "标记", "当前文件", "所在文件夹", "剪辑时间", "数据速率", "分辨率", "状态")
+        widths = (100, 70, 160, 150, 130, 95, 95, 85)
         self.tree = ttk.Treeview(listf, columns=cols, show="headings", selectmode="extended")
         for c, h, w in zip(cols, heads, widths):
             self.tree.heading(c, text=h)
-            self.tree.column(c, width=w, anchor=tk.W, stretch=(c in ("file", "dir")))
+            self.tree.column(c, width=w, anchor=tk.W, stretch=(c in ("file", "dir", "mark")))
         vsb = ttk.Scrollbar(listf, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -525,7 +562,10 @@ class WorkflowTab:
         # 分辨率着色图例：标准分辨率绿色，特殊/裁剪分辨率红色
         legend = ttk.Frame(lf)
         legend.pack(side=tk.BOTTOM, fill=tk.X, pady=(2, 0))
-        ttk.Label(legend, text="分辨率着色：", anchor=tk.W).pack(side=tk.LEFT)
+        ttk.Label(legend, text="标记：", anchor=tk.W).pack(side=tk.LEFT)
+        ttk.Label(legend, text="✂ 需剪辑", foreground="#c62828").pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(legend, text="📝 有字幕", foreground="#1565c0").pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(legend, text="　分辨率着色：", anchor=tk.W).pack(side=tk.LEFT)
         ttk.Label(legend, text="■ 标准", foreground="#1b6b2f").pack(side=tk.LEFT, padx=(0, 10))
         ttk.Label(legend, text="■ 特殊/裁剪", foreground="#c62828").pack(side=tk.LEFT)
         # 已加入任务清单的视频：高亮标记（浅绿底），避免重复选择
@@ -879,6 +919,7 @@ class WorkflowTab:
         self.tc_aspect = tk.StringVar(value="保持原比例")
         self.tc_bitrate = tk.IntVar(value=2500)
         self.tc_keep_br = tk.BooleanVar(value=False)   # 不修改码率：沿用原片码率
+        self.tc_br_below_keep = tk.BooleanVar(value=False)  # 低于设置值不修改：原片码率低于设置值时保持原片
         self.tc_encoder = tk.StringVar(value=ENCODER_LABELS["auto"])
         self.tc_save_src = tk.BooleanVar(value=True)
         self.tc_save_dir = tk.StringVar()
@@ -964,14 +1005,13 @@ class WorkflowTab:
         self._hint(f, "四种模式：①预设固定分辨率（含竖屏自动适配）②自定义宽高"
                       "③固定宽或高、另一边自动 ④固定长边/短边、另一边自动（自动含竖屏适配）。"
                       "原片不足目标尺寸处自动补黑边，画面不变形。")
-        self._tc_br_row = row("", lambda r: (
-            ttk.Label(r, text="码率(kbps)", width=12).pack(side=tk.LEFT),
-            self._tc_bitrate_spin_pack(r),
-            ttk.Checkbutton(r, text="不修改码率（沿用原片码率）",
-                            variable=self.tc_keep_br).pack(side=tk.LEFT, padx=(10, 0))))
+        self._tc_br_row = row("", self._build_br_row)
         self._hint(f, "勾选“不修改码率”后，每个视频按自身原片码率编码"
                       "（改分辨率/比例、起止剪辑、添加字幕时都保持原码率），"
-                      "无需因各视频码率不同而逐个调整；读不到原片码率时回退为上方数值。")
+                      "无需因各视频码率不同而逐个调整；读不到原片码率时回退为上方数值。\n"
+                      "勾选“低于设置值不修改”后：原片码率高于设置值时降到设置值（控制体积/统一规格），"
+                      "原片码率低于设置值时保持原片码率（避免低码率视频被强行拉高、体积虚增）。"
+                      "二者同时勾选时以“不修改码率”优先。")
 
         # 竖屏自动适配：横屏/竖屏混合时，竖屏源自动改用竖屏目标分辨率
         # （“固定长边/短边”模式已随原片方向自动适配，该项自动置灰、无需勾选）
@@ -1049,7 +1089,19 @@ class WorkflowTab:
         self.tc_sub.trace_add('write', lambda *a: self._update_param_states())
         self.tc_keepq.trace_add('write', lambda *a: self._update_param_states())
         self.tc_keep_br.trace_add('write', lambda *a: self._update_param_states())
+        self.tc_br_below_keep.trace_add('write', lambda *a: self._update_param_states())
         self._update_param_states()
+
+    def _build_br_row(self, r):
+        """码率行：数值框 + “不修改码率” + “低于设置值不修改”两个复选框。"""
+        ttk.Label(r, text="码率(kbps)", width=12).pack(side=tk.LEFT)
+        self._tc_bitrate_spin_pack(r)
+        ttk.Checkbutton(r, text="不修改码率（沿用原片码率）",
+                        variable=self.tc_keep_br).pack(side=tk.LEFT, padx=(10, 0))
+        self._tc_br_below_chk = ttk.Checkbutton(
+            r, text="低于设置值不修改", variable=self.tc_br_below_keep)
+        self._tc_br_below_chk.pack(side=tk.LEFT, padx=(10, 0))
+        return r
 
     def _tc_bitrate_spin_pack(self, r):
         """码率输入框（保留引用，便于“不修改码率”时禁用）"""
@@ -1209,6 +1261,14 @@ class WorkflowTab:
             try:
                 spin.configure(state='disabled'
                                if (self.tc_keep_br.get() or not spec_on) else 'normal')
+            except Exception:
+                pass
+        # “低于设置值不修改”与“不修改码率”互斥（后者优先）；流拷贝时不重编码也禁用
+        below_chk = getattr(self, '_tc_br_below_chk', None)
+        if below_chk is not None:
+            try:
+                below_chk.configure(
+                    state='disabled' if (self.tc_keep_br.get() or not spec_on) else 'normal')
             except Exception:
                 pass
         srt_on = (self.tc_sub.get() != SUBTITLE_MODE_LABELS.get('none'))
@@ -1412,7 +1472,17 @@ class WorkflowTab:
             rate = f"{it.video_kbps} kbps" if it.video_kbps else "—"
             res = f"{it.width}x{it.height}" if it.width and it.height else "—"
             is_added = os.path.normpath(it.origin) in added
-            status = "已添加" if is_added else (it.status or "")
+            # 状态列：运行期实时状态（翻译 3/20、剪辑 45%、移动中…）优先显示，
+            # 无实时状态时才显示“已添加”标记（此前“已添加”会覆盖实时进度）
+            live = (it.status or "").strip()
+            status = live or ("已添加" if is_added else "")
+            # 标记列图标：✂ 需剪辑、📝 有字幕（可同时出现）
+            marks = []
+            if it.need_trim:
+                marks.append("✂")
+            if it.has_subtitle:
+                marks.append("📝")
+            mark = " ".join(marks)
             # 分辨率着色：标准分辨率（含横/竖两种朝向）绿色，
             #            特殊/裁剪过的分辨率（如 960x1264）红色，未知（未探测）默认
             if it.width and it.height:
@@ -1423,7 +1493,7 @@ class WorkflowTab:
                 res_tag = ""
             tags = tuple(t for t in (("added" if is_added else ""), res_tag) if t)
             self.tree.insert("", tk.END, iid=it.uid, values=(
-                it.uid, os.path.basename(it.path),
+                it.uid, mark, os.path.basename(it.path),
                 os.path.normpath(os.path.dirname(it.path)),
                 trim, rate, res, status),
                 tags=tags)
@@ -1454,6 +1524,152 @@ class WorkflowTab:
     def _clear_items(self):
         self.items = []
         self._refresh_tree()
+
+    # ---------- 操作标记（需剪辑 / 有字幕） ----------
+    def _toggle_mark(self, mark: str):
+        """对选中的视频批量切换“需剪辑 / 有字幕”标记。
+
+        语义：若选中项全部已带该标记 → 全部取消；否则全部打上（一键“添加或删除”）。
+        这些标记仅用于提醒操作者接下来的操作，不影响实际转码/改名等步骤。
+        """
+        if self.executor and self.executor.is_alive():
+            show_toast(self.frame, "工作流执行中，暂不能修改标记", "warning")
+            return
+        items = self._selected_items()
+        if not items:
+            show_toast(self.frame, "请先在视频清单中选中视频", "info")
+            return
+        attr = "need_trim" if mark == "need_trim" else "has_subtitle"
+        label = "需剪辑" if mark == "need_trim" else "有字幕"
+        all_on = all(bool(getattr(it, attr)) for it in items)
+        new_val = not all_on          # 全开→关；否则→开
+        for it in items:
+            setattr(it, attr, new_val)
+        self._refresh_tree()
+        self._log(f"[{label}] 已{'标记' if new_val else '取消标记'} {len(items)} 个视频")
+        show_toast(self.frame, f"已{'标记' if new_val else '取消'} {len(items)} 个“{label}”",
+                   "success")
+
+    # ---------- 清单设置导出 / 导入（标记 + 剪辑时间，跨会话持久化） ----------
+    def _item_fingerprint(self, it) -> str:
+        """文件的快速指纹（不读文件内容，仅取 名称+大小+修改时间），用于导入时匹配。
+
+        比 md5 快得多（避免对多 GB 视频整文件哈希），足以在“重新加入同一文件”时
+        准确匹配；同时导出时仍记录原始 path，优先按路径精确匹配，指纹作为兜底。
+        """
+        name = os.path.basename(it.path)
+        size = mtime = 0
+        try:
+            st = os.stat(it.path)
+            size, mtime = st.st_size, st.st_mtime
+        except Exception:
+            pass
+        return f"{name}|{size}|{mtime}"
+
+    def _export_marks(self):
+        """将当前清单所有视频的标记（需剪辑/有字幕）与剪辑起止时间导出为 JSON。
+
+        每条记录带 path + 快速指纹（名称|大小|修改时间），以便下次重新加入文件后
+        按“路径→指纹→名称”顺序精准匹配并恢复设置，不会因文件名重复而搞错。
+        """
+        if not self.items:
+            show_toast(self.frame, "清单为空，无可导出项", "warning")
+            return
+        path = filedialog.asksaveasfilename(
+            title="导出视频清单设置（标记 + 剪辑时间）",
+            defaultextension=".json",
+            filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")])
+        if not path:
+            return
+        items_data = []
+        for it in self.items:
+            fp = self._item_fingerprint(it)
+            items_data.append({
+                "uid": it.uid,
+                "path": it.path,
+                "name": os.path.basename(it.path),
+                "size": int(fp.split("|")[1]),
+                "mtime": float(fp.split("|")[2]),
+                "fingerprint": fp,
+                "need_trim": bool(it.need_trim),
+                "has_subtitle": bool(it.has_subtitle),
+                "trim_start": float(it.trim_start),
+                "trim_end": float(it.trim_end),
+                "use_custom_trim": bool(it.use_custom_trim),
+            })
+        data = {
+            "app": "视频文件管理工具",
+            "feature": "视频清单设置",
+            "version": 1,
+            "exported_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "count": len(items_data),
+            "match_note": "导入时按 路径→指纹(名称|大小|修改时间)→名称 顺序匹配",
+            "items": items_data,
+        }
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            self._log(f"[导出] 已导出 {len(items_data)} 个视频设置 → {path}")
+            show_toast(self.frame, f"已导出 {len(items_data)} 项设置", "success")
+        except Exception as e:
+            show_toast(self.frame, f"导出失败: {e}", "error")
+
+    def _import_marks(self):
+        """从 JSON 恢复标记与剪辑时间：仅对“已重新加入”且能匹配的视频生效。
+
+        匹配优先级：① 路径完全一致；② 指纹（名称|大小|修改时间）一致；③ 文件名一致。
+        未匹配到的导出项（对应文件未重新加入）会提示数量，避免静默丢失。
+        """
+        if not self.items:
+            show_toast(self.frame, "请先重新加入视频文件，再导入设置", "warning")
+            return
+        path = filedialog.askopenfilename(
+            title="导入视频清单设置（标记 + 剪辑时间）",
+            filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            show_toast(self.frame, f"读取失败: {e}", "error")
+            return
+        recs = data.get("items") or []
+        if not recs:
+            show_toast(self.frame, "文件中没有可导出的视频记录", "warning")
+            return
+
+        by_path: Dict[str, dict] = {}
+        by_fp: Dict[str, dict] = {}
+        by_name: Dict[str, dict] = {}
+        for r in recs:
+            rp = r.get("path")
+            if rp:
+                by_path.setdefault(os.path.normpath(rp), r)
+            fp = r.get("fingerprint") or \
+                f"{r.get('name')}|{r.get('size')}|{r.get('mtime')}"
+            by_fp.setdefault(fp, r)
+            by_name.setdefault(r.get("name"), r)
+
+        matched = unmatched = 0
+        for it in self.items:
+            norm = os.path.normpath(it.path)
+            r = (by_path.get(norm)
+                 or by_fp.get(self._item_fingerprint(it))
+                 or by_name.get(os.path.basename(it.path)))
+            if not r:
+                unmatched += 1
+                continue
+            it.need_trim = bool(r.get("need_trim", False))
+            it.has_subtitle = bool(r.get("has_subtitle", False))
+            it.trim_start = float(r.get("trim_start", 0.0) or 0.0)
+            it.trim_end = float(r.get("trim_end", 0.0) or 0.0)
+            it.use_custom_trim = bool(r.get("use_custom_trim", False))
+            matched += 1
+        self._refresh_tree()
+        self._log(f"[导入] 已匹配 {matched} 项，未匹配 {unmatched} 项"
+                  f"（未匹配多为文件尚未重新加入）")
+        show_toast(self.frame, f"已导入 {matched} 项（{unmatched} 项未匹配）", "info")
 
     # ---------- 数据速率探测（视频流码率，不含音频） ----------
     def _resolve_ffprobe(self):
@@ -1608,11 +1824,13 @@ class WorkflowTab:
             show_toast(self.frame, f"文件不存在: {it.path}", "error")
             return
         dlg = TrimTimeDialog(self.frame, it.path, it.trim_start, it.trim_end,
-                             it.use_custom_trim)
+                             it.use_custom_trim, item=it)
         if dlg.result:
             s, e, custom = dlg.result
             it.trim_start, it.trim_end, it.use_custom_trim = s, e, custom
-            self._refresh_tree()
+        # 不论是否改了剪辑时间，对话框内的“需剪辑/有字幕”标记都可能被改动，统一刷新
+        self._refresh_tree()
+        if dlg.result:
             self._log(f"[剪辑时间] {it.uid}: {format_clock(s)} ~ {format_clock(e)}"
                       f"（仅对该视频生效）")
 
@@ -1886,6 +2104,7 @@ class WorkflowTab:
                 self.tc_aspect.set(p.get('aspect', '保持原比例'))
                 self.tc_bitrate.set(int(p.get('bitrate') or 2500))
                 self.tc_keep_br.set(bool(p.get('keep_bitrate', False)))
+                self.tc_br_below_keep.set(bool(p.get('bitrate_below_keep', False)))
                 self.tc_encoder.set(p.get('encoder') or ENCODER_LABELS['auto'])
                 self.tc_save_src.set(p.get('save_mode', 'source') == 'source')
                 self.tc_save_dir.set(p.get('save_dir', ''))
@@ -1981,6 +2200,8 @@ class WorkflowTab:
                 pass
             # 不修改码率：沿用每个视频自身的原片码率（读不到时回退上面的数值）
             p['keep_bitrate'] = bool(self.tc_keep_br.get())
+            # 低于设置值不修改：原片码率低于设置值时保持原片，高于时降到设置值
+            p['bitrate_below_keep'] = bool(self.tc_br_below_keep.get())
             p['encoder'] = self.tc_encoder.get()
             p['save_mode'] = 'source' if self.tc_save_src.get() else 'custom'
             p['save_dir'] = self.tc_save_dir.get().strip()

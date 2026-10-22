@@ -93,21 +93,22 @@ class WorkflowExecutor(threading.Thread):
     # ---------------- 控制 ----------------
     def stop(self):
         self._stop_event.set()
-        # 若处于暂停（子进程被冻结），需先标记停止并解除冻结、终止所有活动子进程，
-        # 否则 worker 线程会一直卡在冻结的 stdout / 协作式等待上无法退出；
-        # 同时唤醒门闸处等待的 worker，使其检出停止信号后退出。
+        # 对所有活动条目标记停止：转码步骤据此让 ffmpeg worker 尽快自检退出；
+        # 字幕步骤据此调用生成器 cancel()，在下一检查点立即中断（音频提取/识别/
+        # 逐条翻译），而不是等整步跑完。若处于暂停（子进程被冻结），还需解除冻结、
+        # 终止所有活动子进程，否则 worker 线程会一直卡在冻结的 stdout / 协作式等待上。
         with self._ctx_lock:
             ctxs = list(self._active_ctxs)
         for ctx in ctxs:
             try:
+                ctx.mark_stopped()
                 if ctx.paused:
-                    ctx.mark_stopped()
                     ctx.resume()
                     ctx.terminate_active_proc()
             except Exception:
                 pass
         self._pause_event.clear()
-        self.log("[停止] 正在请求停止，当前步骤完成后退出…")
+        self.log("[停止] 已请求停止：正在中断当前步骤（字幕生成在下一检查点退出）…")
 
     @property
     def stopped(self) -> bool:
@@ -312,6 +313,8 @@ class WorkflowExecutor(threading.Thread):
         )
         ctx.subtitle_coordinator = self._coordinator
         ctx.resource_lock = self._heavy_lock
+        # 注入“状态列”更新通道：步骤内调用 ctx.status("剪辑 45%") 实时刷新清单状态
+        ctx.status_setter = lambda text, _it=item: self._set_item_status(_it, text)
         # 拼接任务：把本任务内的全部条目交给步骤（转码步骤据此把多个视频合并为一个成片）
         ctx.task_items = list(task_items) if task_items else [item]
         with self._ctx_lock:
@@ -392,6 +395,8 @@ class WorkflowExecutor(threading.Thread):
             else:
                 item.record(step.label, str(before), str(before), True, "路径未变化")
                 self.log(f"  ✔ 完成（当前文件: {item.name}）")
+            # 复位本步骤写入的实时阶段（如“剪辑 45%”“移动中”），进入下一步骤前回到“进行中”
+            item.status = "进行中"
             self._emit_item(item, force=True)
 
         with self._ctx_lock:
@@ -445,6 +450,18 @@ class WorkflowExecutor(threading.Thread):
                     except Exception:
                         pass
                 self.log("[字幕] 后续任务均不再需要翻译模型，已释放其显存")
+
+    def _set_item_status(self, item, text: str):
+        """更新条目“状态”列的实时阶段文本（如“剪辑 45%”“翻译 3/20”“移动中”）。
+
+        刷新策略：离散阶段（“移动中”“剪辑中”等，不含 %）立即强制刷新，避免被节流
+        吞掉而错过短暂阶段；百分比进度（“剪辑 45%”）沿用 0.3s 节流防刷屏。
+        """
+        try:
+            item.status = str(text)
+        except Exception:
+            pass
+        self._emit_item(item, force=('%' not in text))
 
     def _set_item_progress(self, item, pct):
         # 进度聚合：每个条目的 pct 为 0~100 百分比，整体进度 = 各条目进度的平均值
