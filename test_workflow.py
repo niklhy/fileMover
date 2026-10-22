@@ -161,8 +161,8 @@ def test_flow_a_move_transcode_move_subtitle():
                     f"{it.status} {it.message}")
         ok &= check(f"{it.uid} 落在 C 下的 UID 子目录",
                     it.path.startswith(str(c / it.uid)), it.path)
-        ok &= check(f"{it.uid} 成片沿用原文件名（改名职责归修改名称步骤）",
-                    Path(it.path).name == f"{it.uid}.mp4", Path(it.path).name)
+        ok &= check(f"{it.uid} 成片为转码后缀名（{it.uid}_转码.mp4，旧文件共存）",
+                    Path(it.path).name == f"{it.uid}_转码.mp4", Path(it.path).name)
         ok &= check(f"{it.uid} 字幕已生成", bool(it.subtitle) and os.path.isfile(it.subtitle),
                     it.subtitle or "无")
         ok &= check(f"{it.uid} 记录了 4 个阶段轨迹", len(it.history) == 4,
@@ -352,8 +352,8 @@ def test_rename_step():
     items2 = build_items([str(Path(it.path))])
     run_job(job3, items2, [])
     time.sleep(0.2)
-    check("改名→转码后文件名保持改名结果",
-          Path(items2[0].path).name == "SSIS-777_cut.mp4", Path(items2[0].path).name)
+    check("改名→转码（不删源）→ 新文件加后缀共存（SSIS-777_cut_转码.mp4）",
+          Path(items2[0].path).name == "SSIS-777_cut_转码.mp4", Path(items2[0].path).name)
 
     shutil.rmtree(root, ignore_errors=True)
 
@@ -1841,13 +1841,20 @@ def test_transcode_source_dir_rename_safety():
         "out_ext": "mp4", "subtitle_mode": "none", "keep_quality": False,
     }
 
-    # ---- A) 旧行为（无改名步骤）：同文件夹同扩展名转码 → 原地替换原片（保留原语义）----
+    # ---- A) 输出到原文件夹、不删除源文件、无改名步骤：原片保留，新文件加后缀共存 ----
     it_a = WorkflowItem(origin=str(orig), current=str(orig), uid="SSIS-026")
     ctx_a = StepContext(log=lambda m: None, ffmpeg_path=FFMPEG)
     ctx_a.rename_after_transcode = False
-    prod_a = run_transcode(it_a, dict(tc_params), ctx_a)
-    check("无改名步骤时同文件夹转码走原地替换（成片沿用原文件名）",
-          Path(prod_a).name == "SSIS-026.mp4", f"prod={Path(prod_a).name}")
+    prod_a = run_transcode(it_a, dict(tc_params), ctx_a)   # tc_params 未设 del_src → False
+    check("不删除源文件时同文件夹转码：原始视频保留（未被覆盖/删除）",
+          orig.exists(), f"orig.exists={orig.exists()}")
+    check("不删除源文件时新文件按原文件名加后缀共存（SSIS-026_转码.mp4）",
+          Path(prod_a).name == "SSIS-026_转码.mp4", f"prod={Path(prod_a).name}")
+    # 清理本次产物，避免影响后续子测试
+    try:
+        Path(prod_a).unlink()
+    except OSError:
+        pass
 
     # 重置：再生成一个原始片用于后续测试
     make_video(orig, seconds=3)
@@ -1906,6 +1913,238 @@ def test_transcode_source_dir_rename_safety():
 
 
 # ======================================================================
+def test_item_status_live_updates():
+    """[28] 运行中视频清单“状态”列实时显示阶段（剪辑中/移动中/改名中/翻译 N/M）"""
+    print("\n[28] 视频清单实时状态显示")
+    from workflow.models import ENCODER_LABELS
+    from workflow.steps import run_transcode, run_move, run_rename
+
+    root = Path(tempfile.mkdtemp(prefix="wf_status_"))
+    folder = root / "src"
+    folder.mkdir()
+    outdir = root / "out"
+    outdir.mkdir()
+
+    def collect(job_steps, handlers, file):
+        src = folder / file
+        make_video(src, seconds=3)
+        got = []
+        items = build_items([str(src)])
+        job = WorkflowJob(name="状态测试", steps=job_steps)
+        ex = WorkflowExecutor(job, items, ffmpeg_path=FFMPEG,
+                              on_log=lambda m: None,
+                              on_item=lambda it: got.append(it.status),
+                              on_progress=lambda p, t="": None,
+                              handlers=handlers)
+        ex.run()
+        return got
+
+    # A) 移动 + 改名：应实时出现“移动中”“改名中”，最终“已完成”
+    got = collect(
+        [WorkflowStep(STEP_MOVE, params={"target_dir": str(outdir)}),
+         WorkflowStep(STEP_RENAME, params={"name_template": "{uid}_ren",
+                                           "with_companions": False})],
+        {STEP_MOVE: run_move, STEP_RENAME: run_rename}, "ST-028.mp4")
+    check("移动步骤实时显示“移动中”", "移动中" in got, str(got))
+    check("改名步骤实时显示“改名中”", "改名中" in got, str(got))
+    check("全部步骤完成后状态为“已完成”", bool(got) and got[-1] == "已完成", str(got))
+
+    # B) 剪辑转码：应出现“剪辑中”起始阶段（及/或“剪辑 N%”），最终“已完成”
+    tc_params = {"trim_mode": "none", "resolution": "320x240", "bitrate": 600,
+                 "encoder": ENCODER_LABELS['cpu'], "save_mode": "custom",
+                 "save_dir": str(outdir), "out_ext": "mp4",
+                 "subtitle_mode": "none", "keep_quality": False}
+    got2 = collect([WorkflowStep(STEP_TRANSCODE, params=tc_params)],
+                   {STEP_TRANSCODE: run_transcode}, "TC-028.mp4")
+    check("转码步骤实时显示“剪辑中”（或剪辑百分比）",
+          any(s == "剪辑中" or (s or "").startswith("剪辑 ") for s in got2), str(got2))
+    check("转码完成后状态复位为“已完成”", bool(got2) and got2[-1] == "已完成", str(got2))
+
+    # C) ctx.status 通道（字幕逐条翻译同款机制）：桩 handler 写入“翻译 3/20”
+    def fake_sub(item, params, ctx):
+        ctx.status("翻译 3/20")
+        return item.path
+
+    got3 = collect([WorkflowStep(STEP_SUBTITLE, params={})],
+                   {STEP_SUBTITLE: fake_sub}, "SUB-028.mp4")
+    check("ctx.status 写入的“翻译 3/20”可到达清单状态列", "翻译 3/20" in got3, str(got3))
+
+    shutil.rmtree(root, ignore_errors=True)
+
+
+# ======================================================================
+def test_stop_interrupts_current_step():
+    """[29] 任务进行中点“停止”：立即触发活动步骤的停止钩子并中断（不再等整步跑完）"""
+    print("\n[29] 运行中停止立即中断当前步骤")
+    flag = {"entered": False, "cancelled": 0}
+
+    def slow_handler(item, params, ctx):
+        # 模拟字幕步骤：注册停止钩子（生成器 cancel 同款机制）+ 协作式检查点循环
+        ctx.set_stop_setter(lambda: flag.__setitem__("cancelled", flag["cancelled"] + 1))
+        flag["entered"] = True
+        deadline = time.time() + 10
+        while not ctx.stopped() and time.time() < deadline:
+            time.sleep(0.02)
+        if ctx.stopped():
+            raise StepStopped("已停止")
+        return item.path
+
+    root = Path(tempfile.mkdtemp(prefix="wf_stop_"))
+    folder = root / "src"
+    folder.mkdir()
+    src = folder / "STOP-029.mp4"
+    make_video(src, seconds=2)
+
+    got = []
+    items = build_items([str(src)])
+    job = WorkflowJob(name="停止测试", steps=[WorkflowStep(STEP_MOVE, params={})])
+    ex = WorkflowExecutor(job, items, ffmpeg_path=FFMPEG,
+                          on_log=lambda m: None,
+                          on_item=lambda it: got.append(it.status),
+                          on_progress=lambda p, t="": None,
+                          handlers={STEP_MOVE: slow_handler})
+    th = threading.Thread(target=ex.run, daemon=True)
+    th.start()
+    deadline = time.time() + 10
+    while not flag["entered"] and time.time() < deadline:
+        time.sleep(0.02)
+    check("慢步骤已开始执行", flag["entered"], f"entered={flag['entered']}")
+    time.sleep(0.15)          # 确保 worker 已进入检查点循环
+    ex.stop()
+    th.join(timeout=15)
+    check("停止钩子被立即调用（此前仅暂停中的 ctx 才会标记停止）",
+          flag["cancelled"] == 1, f"cancelled={flag['cancelled']}")
+    check("worker 线程已退出（未等 10s 超时）", not th.is_alive(), f"alive={th.is_alive()}")
+    check("条目最终状态为“已停止”", bool(got) and got[-1] == "已停止", str(got))
+    check("停止计数入账", ex.stats.get("stopped") == 1, str(ex.stats))
+
+    shutil.rmtree(root, ignore_errors=True)
+
+
+# ======================================================================
+def test_bitrate_below_keep():
+    """[27] “低于设置值不修改”：原片码率高于设置值降到设置值，低于设置值保持原片"""
+    print("\n[27] 低于设置值不修改（码率封顶/保持原片）")
+    from workflow.models import WorkflowItem, ENCODER_LABELS
+    from workflow.steps import StepContext, run_transcode
+
+    fp = shutil.which('ffprobe') or FFMPEG.replace('ffmpeg', 'ffprobe')
+
+    def probe_dur(p: str) -> float:
+        out = subprocess.run([fp, '-v', 'error', '-show_entries', 'format=duration',
+                              '-of', 'csv=p=0', str(p)],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             timeout=30).stdout.decode('utf-8', 'replace').strip()
+        try:
+            return float(out)
+        except ValueError:
+            return 0.0
+
+    def avg_br(p: str) -> int:
+        """用「文件大小 / 时长」算平均码率（kbps），避免 ffprobe 码率标签与实测不符"""
+        d = probe_dur(p)
+        if d <= 0:
+            return 0
+        return int(Path(p).stat().st_size * 8 / (d * 1000))
+
+    def make_src(name, br_k):
+        # mandelbrot 细节极高，x264 实际码率会随 -b:v 明显变化（静帧 testsrc 则不会）
+        p = root / name
+        subprocess.run([FFMPEG, '-y', '-loglevel', 'error', '-f', 'lavfi',
+                        '-i', 'mandelbrot=size=320x240:rate=25', '-t', '4',
+                        '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-b:v',
+                        f'{br_k}k', str(p)],
+                       capture_output=True, check=True)
+        return p
+
+    root = Path(tempfile.mkdtemp(prefix="wf_belowkeep_"))
+    folder = root / "src"
+    folder.mkdir()
+    hi = make_src("hi.mp4", 4000)     # 高码率源（远高于设置值 1500）
+    lo = make_src("lo.mp4", 400)      # 低码率源（远低于设置值 1500）
+    hi_br0, lo_br0 = avg_br(hi), avg_br(lo)
+    check("源高码率明显 > 源低码率", hi_br0 > lo_br0 * 2, f"hi={hi_br0} lo={lo_br0}")
+    check("源高码率 > 设置值", hi_br0 > 1500, f"hi={hi_br0}")
+    check("源低码率 < 设置值", lo_br0 < 1500, f"lo={lo_br0}")
+
+    setting = 1500
+    base = dict(trim_mode="none", resolution="320x240", bitrate=setting,
+                encoder=ENCODER_LABELS['cpu'], save_mode="custom",
+                save_dir=str(folder), out_ext="mp4", subtitle_mode="none",
+                keep_quality=False)
+
+    def run_one(src, br_below):
+        it = WorkflowItem(origin=str(src), current=str(src), uid="BK")
+        ctx = StepContext(log=lambda m: None, ffmpeg_path=FFMPEG)
+        params = dict(base)
+        params['bitrate_below_keep'] = br_below
+        produced = run_transcode(it, params, ctx)
+        return avg_br(produced)
+
+    # 勾选“低于设置值不修改”
+    hi_out = run_one(hi, True)
+    lo_out = run_one(lo, True)
+    check("高码率源：勾选后降到设置值（封顶）",
+          hi_out <= setting * 1.6 and hi_out < hi_br0 * 0.7,
+          f"src={hi_br0} out={hi_out} set={setting}")
+    check("低码率源：勾选后保持原片码率（未被拉高）",
+          lo_out < setting * 0.9 and lo_out > 0,
+          f"src={lo_br0} out={lo_out} set={setting}")
+
+    # 不勾选（对照）：低码率源被强行拉到设置值
+    lo_ctrl = run_one(lo, False)
+    check("低码率源：不勾选时被拉到设置值（验证选项生效）",
+          lo_ctrl > lo_br0 * 2, f"src={lo_br0} ctrl={lo_ctrl} set={setting}")
+
+    shutil.rmtree(root, ignore_errors=True)
+
+
+# ======================================================================
+def test_transcode_source_del_src_strategy():
+    """[30] 转码输出到原文件夹：删除源→原地替换(文件名不变)；不删源→原文件名加后缀共存"""
+    print("\n[30] 转码到原文件夹的两种文件名策略（删源 / 不删源）")
+    from workflow.models import WorkflowItem, ENCODER_LABELS
+    from workflow.steps import StepContext, run_transcode
+
+    root = Path(tempfile.mkdtemp(prefix="wf_tcsrc_"))
+    folder = root / "src"
+    folder.mkdir()
+    base = dict(trim_mode="none", resolution="320x240", bitrate=600,
+                encoder=ENCODER_LABELS['cpu'], save_mode="source",
+                out_ext="mp4", subtitle_mode="none", keep_quality=False)
+
+    # ---- 不删除源文件：原片保留，新文件按原文件名加“_转码”后缀共存 ----
+    orig1 = folder / "NC-030.mp4"
+    make_video(orig1, seconds=3)
+    it1 = WorkflowItem(origin=str(orig1), current=str(orig1), uid="NC-030")
+    ctx1 = StepContext(log=lambda m: None, ffmpeg_path=FFMPEG)
+    prod1 = run_transcode(it1, dict(base, del_src=False), ctx1)
+    check("不删源：原始视频保留（未被覆盖/删除）",
+          orig1.exists(), f"orig.exists={orig1.exists()}")
+    check("不删源：新文件为原文件名加后缀（NC-030_转码.mp4）",
+          Path(prod1).name == "NC-030_转码.mp4", Path(prod1).name)
+    check("不删源：新文件与旧文件是两个不同文件",
+          not Path(prod1).samefile(orig1), Path(prod1).name)
+
+    # ---- 删除源文件：原地替换，文件名不变，旧文件被替换（无共存后缀文件）----
+    orig2 = folder / "DL-030.mp4"
+    make_video(orig2, seconds=3)
+    it2 = WorkflowItem(origin=str(orig2), current=str(orig2), uid="DL-030")
+    ctx2 = StepContext(log=lambda m: None, ffmpeg_path=FFMPEG)
+    prod2 = run_transcode(it2, dict(base, del_src=True), ctx2)
+    check("删源：成片沿用原文件名（DL-030.mp4）",
+          Path(prod2).name == "DL-030.mp4", Path(prod2).name)
+    check("删源：不存在带后缀的共存文件（已原地替换而非共存）",
+          not (folder / "DL-030_转码.mp4").exists(),
+          str(sorted(p.name for p in folder.glob('*'))))
+    check("删源：成片即原始路径（原地替换）",
+          os.path.normcase(os.path.abspath(str(prod2))) ==
+          os.path.normcase(os.path.abspath(str(orig2))), Path(prod2).name)
+
+    shutil.rmtree(root, ignore_errors=True)
+
+
+# ======================================================================
 def main():
     print("=" * 72)
     print("工作流串联模块自测")
@@ -1935,6 +2174,10 @@ def main():
     test_resolution_modes()
     test_keyframe_aligned_seek()
     test_transcode_source_dir_rename_safety()
+    test_transcode_source_del_src_strategy()
+    test_item_status_live_updates()
+    test_stop_interrupts_current_step()
+    test_bitrate_below_keep()
 
     total = len(_results)
     failed = [r for r in _results if not r[1]]

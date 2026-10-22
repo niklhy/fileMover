@@ -333,6 +333,9 @@ class WorkflowItem:
     trim_start: float = 0.0
     trim_end: float = 0.0
     use_custom_trim: bool = False
+    # 操作标记：提醒操作者该视频接下来要做什么（导出/导入可持久化恢复）
+    need_trim: bool = False        # 需剪辑：已规划要裁剪/转码
+    has_subtitle: bool = False     # 已有字幕：源片已带（或可复用）字幕
     # 探测到的媒体信息
     duration: float = 0.0
     fps: float = 0.0
